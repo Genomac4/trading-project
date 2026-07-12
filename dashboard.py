@@ -9,6 +9,7 @@ from data_layer import get_valuation
 from explore_constituents import get_sp500_membership
 from backtest_composite import cached_fscore, cached_value, zscore
 from pit_factors import pit_fscore, pit_value_inputs
+from screener import get_regime_weights
 
 PRICE_DIR = "data/universe_prices"
 TRADE_LOG = "trade_log.csv"
@@ -137,18 +138,22 @@ def add_zscores(df, w_mom, w_qual, w_val, w_trend):
 
 
 # ---------- Regime ----------
-def regime_banner():
-    spy = spy_prices()
-    ma200 = spy.rolling(200).mean()
-    above = spy.iloc[-1] > ma200.iloc[-1]
-    pct = (spy.iloc[-1] / ma200.iloc[-1]) - 1
-    if above:
+def current_regime():
+    """Single source of truth for the regime + its backtest-derived weights."""
+    return get_regime_weights(spy_prices())
+
+
+def regime_banner(reg):
+    pct = reg["pct_vs_200d"]
+    w = reg["weights"]
+    weight_str = (f"momentum {w['momentum']:.2f} · quality {w['quality']:.2f} · "
+                  f"value {w['value']:.2f} · trend {w['trend']:.2f}")
+    if reg["trending"]:
         st.success(f"MARKET REGIME: TRENDING — SPY {pct:+.1%} vs 200d MA. "
-                   f"Backtest evidence favors momentum-heavy weights.")
+                   f"Active weight set (momentum-heavy, from backtest): {weight_str}.")
     else:
         st.warning(f"MARKET REGIME: CHOPPY/DEFENSIVE — SPY {pct:+.1%} vs 200d MA. "
-                   f"Backtest evidence favors quality/trend-heavy weights.")
-    return above
+                   f"Active weight set (quality/trend-heavy, from backtest): {weight_str}.")
 
 
 # ---------- Thesis ----------
@@ -293,7 +298,8 @@ def show_table(df):
 
 
 # ---------- UI ----------
-trending = regime_banner()
+reg = current_regime()
+regime_banner(reg)
 
 # --- Data freshness ---
 prices_check = load_prices()
@@ -317,16 +323,24 @@ if rc2.button("Quick refresh: my holdings"):
     status.update(label=f"Refreshed {n} tickers.", state="complete")
 
 st.sidebar.header("Factor Weights")
-if trending:
-    st.sidebar.caption("Regime suggests: momentum-heavy")
-    d_mom, d_qual, d_val, d_tr = 0.5, 0.5, 0.0, 0.0
+# Defaults are set automatically from the current regime (see get_regime_weights
+# in screener.py). The sliders below are a manual override — move them and the
+# scan uses your values instead of the regime defaults.
+dw = reg["weights"]
+st.sidebar.caption(f"Regime default: **{reg['regime']}** — weights auto-set from "
+                   f"the multi-period backtest. Sliders override.")
+w_mom = st.sidebar.slider("Momentum", 0.0, 1.0, dw["momentum"], 0.05)
+w_qual = st.sidebar.slider("Quality (F-score)", 0.0, 1.0, dw["quality"], 0.05)
+w_val = st.sidebar.slider("Value (earnings yield)", 0.0, 1.0, dw["value"], 0.05)
+w_trend = st.sidebar.slider("Trend (vs 200d)", 0.0, 1.0, dw["trend"], 0.05)
+
+# Tell the user which weight set is actually driving the scan.
+active = {"momentum": w_mom, "quality": w_qual, "value": w_val, "trend": w_trend}
+if active == dw:
+    st.sidebar.success(f"Using {reg['regime']} regime defaults (unmodified).")
 else:
-    st.sidebar.caption("Regime suggests: quality/trend-heavy")
-    d_mom, d_qual, d_val, d_tr = 0.3, 0.4, 0.0, 0.3
-w_mom = st.sidebar.slider("Momentum", 0.0, 1.0, d_mom, 0.05)
-w_qual = st.sidebar.slider("Quality (F-score)", 0.0, 1.0, d_qual, 0.05)
-w_val = st.sidebar.slider("Value (earnings yield)", 0.0, 1.0, d_val, 0.05)
-w_trend = st.sidebar.slider("Trend (vs 200d)", 0.0, 1.0, d_tr, 0.05)
+    st.sidebar.info("MANUAL OVERRIDE active — sliders differ from regime defaults.")
+
 top_n = st.sidebar.number_input("Show top N", 5, 50, 20)
 
 tab_scan, tab_search = st.tabs(["Full S&P Scan", "Search Any Ticker"])
