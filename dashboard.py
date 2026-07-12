@@ -15,6 +15,16 @@ PRICE_DIR = "data/universe_prices"
 TRADE_LOG = "trade_log.csv"
 YEAR = datetime.now().year
 
+# Canonical trade-log schema (idea tracker v2). Older logs are migrated to this
+# on read/write (see load_trade_log).
+LOG_COLUMNS = [
+    "date", "ticker", "entry_price", "composite",
+    "momentum", "fscore", "trend", "earn_yield",
+    "above_200d", "regime", "status",
+    "target_price", "stop_price", "notes",
+    "close_date", "close_price", "outcome_note",
+]
+
 st.set_page_config(page_title="Stock Screener", layout="wide")
 st.title("Systematic Stock Screener")
 
@@ -201,20 +211,133 @@ def full_scan(w_mom, w_qual, w_val, w_trend, top_n):
 
 
 # ---------- Trade log ----------
-def log_trade(ticker, price, composite, thesis):
-    row = pd.DataFrame([{
+def load_trade_log():
+    """Read trade_log.csv, tolerating the old schema. Always returns a frame
+    with exactly LOG_COLUMNS so the rest of the app can rely on it."""
+    if not os.path.exists(TRADE_LOG):
+        return pd.DataFrame(columns=LOG_COLUMNS)
+    try:
+        df = pd.read_csv(TRADE_LOG)
+    except Exception:
+        return pd.DataFrame(columns=LOG_COLUMNS)
+    # migrate v1 columns
+    if "price" in df.columns and "entry_price" not in df.columns:
+        df = df.rename(columns={"price": "entry_price"})
+    if "thesis" in df.columns:
+        # preserve the old auto-thesis as notes where notes is empty
+        notes = df.get("notes", pd.Series("", index=df.index)).astype(str)
+        blank = notes.str.strip().isin(["", "nan"])
+        df["notes"] = notes.where(~blank, df["thesis"].astype(str))
+    for col in LOG_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    # default a missing/blank status to "open" so legacy rows still surface
+    status = df["status"].astype(str).str.strip().str.lower()
+    df["status"] = status.where(status.isin(["open", "closed"]), "open")
+    return df[LOG_COLUMNS].reset_index(drop=True)
+
+
+def log_trade(row, reg, target_price="", stop_price="", notes=""):
+    """Record a factor snapshot for an idea as a new OPEN row."""
+    trend = row.get("trend")
+    above = bool(trend > 0) if pd.notna(trend) else ""
+
+    def num(x, nd=4):
+        return round(float(x), nd) if pd.notna(x) else ""
+
+    entry = {
         "date": datetime.now().strftime("%Y-%m-%d"),
-        "ticker": ticker, "price": price,
-        "composite": round(composite, 2), "thesis": thesis,
-    }])
-    if os.path.exists(TRADE_LOG):
-        row.to_csv(TRADE_LOG, mode="a", header=False, index=False)
-    else:
-        row.to_csv(TRADE_LOG, index=False)
+        "ticker": row["Ticker"],
+        "entry_price": num(row.get("price"), 2),
+        "composite": num(row.get("composite"), 2),
+        "momentum": num(row.get("momentum")),
+        "fscore": num(row.get("fscore"), 0),
+        "trend": num(trend),
+        "earn_yield": num(row.get("earn_yield")),
+        "above_200d": above,
+        "regime": reg.get("regime", ""),
+        "status": "open",
+        "target_price": target_price,
+        "stop_price": stop_price,
+        "notes": notes,
+        "close_date": "",
+        "close_price": "",
+        "outcome_note": "",
+    }
+    out = pd.concat([load_trade_log(), pd.DataFrame([entry], columns=LOG_COLUMNS)],
+                    ignore_index=True)
+    out.to_csv(TRADE_LOG, index=False)
+
+
+def close_idea(idx, close_price, note):
+    """Mark the idea at position idx closed, stamping close date/price/note."""
+    df = load_trade_log()
+    if idx not in df.index:
+        return
+    # blank columns read back as float64 (all-NaN); cast to object so writing
+    # date/note strings into them doesn't raise on strict pandas.
+    df = df.astype(object)
+    df.loc[idx, "status"] = "closed"
+    df.loc[idx, "close_date"] = datetime.now().strftime("%Y-%m-%d")
+    df.loc[idx, "close_price"] = round(float(close_price), 2) if close_price is not None else ""
+    df.loc[idx, "outcome_note"] = note
+    df.to_csv(TRADE_LOG, index=False)
+
+
+# ---------- Live scoring for open ideas ----------
+@st.cache_data(show_spinner=False, ttl=1800)
+def universe_factor_frame():
+    """Current factor snapshot for the whole S&P universe — the z-score
+    reference used to recompute an idea's composite 'now'."""
+    prices_all = load_prices()
+    rows = []
+    for t in current_members():
+        if t not in prices_all.columns:
+            continue
+        r = compute_factors(t, prices_all)
+        if r is not None:
+            rows.append({k: r[k] for k in
+                         ("Ticker", "price", "momentum", "trend", "fscore", "earn_yield")})
+    return pd.DataFrame(rows).dropna(subset=["momentum"])
+
+
+def score_against_universe(r, weights, uni_raw):
+    """Composite for one idea's current factors, standardized vs the universe."""
+    if r is None or pd.isna(r.get("momentum")):
+        return None
+    rr = {k: r.get(k) for k in
+          ("Ticker", "price", "momentum", "trend", "fscore", "earn_yield")}
+    frame = uni_raw
+    if len(uni_raw) == 0 or rr["Ticker"] not in set(uni_raw["Ticker"]):
+        frame = pd.concat([uni_raw, pd.DataFrame([rr])], ignore_index=True)
+    if len(frame) < 2:
+        return None
+    scored = add_zscores(frame.copy(), *weights)
+    hit = scored[scored["Ticker"] == rr["Ticker"]]
+    return float(hit.iloc[0]["composite"]) if len(hit) else None
+
+
+def idea_live(ticker, weights, uni_raw):
+    """Cache-first current price + recomputed composite for an open idea.
+    Defensive: a bad/short-history ticker yields Nones, never raises."""
+    price, comp = None, None
+    try:
+        s = get_price_series(ticker, load_prices())
+        if s is not None and len(s) > 0:
+            price = float(s.iloc[-1])
+    except Exception:
+        pass
+    try:
+        r = compute_factors(ticker, load_prices())
+        if r is not None:
+            comp = score_against_universe(r, weights, uni_raw)
+    except Exception:
+        pass
+    return {"price": price, "comp_now": comp}
 
 
 # ---------- Deep dive ----------
-def deep_dive(df, key_prefix):
+def deep_dive(df, key_prefix, reg):
     st.subheader("Deep Dive")
     pick = st.selectbox("Stock", df["Ticker"].tolist(), key=f"{key_prefix}_pick")
     row = df[df["Ticker"] == pick].iloc[0]
@@ -222,7 +345,7 @@ def deep_dive(df, key_prefix):
     thesis = make_thesis(row)
     st.info(thesis)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Price", f"${row['price']:.2f}")
     c1.metric("Composite", f"{row['composite']:.2f}")
     c2.metric("Momentum 12-1", f"{row['momentum']:+.1%}")
@@ -230,9 +353,19 @@ def deep_dive(df, key_prefix):
     c3.metric("F-Score", f"{row['fscore']:.0f}/9" if pd.notna(row['fscore']) else "—")
     c3.metric("Earnings Yield", f"{row['earn_yield']:.1%}" if pd.notna(row['earn_yield']) else "—")
 
-    if c4.button("Log this idea", key=f"{key_prefix}_log"):
-        log_trade(pick, row["price"], row["composite"], thesis)
-        c4.success("Logged")
+    st.markdown("**Log this idea**")
+    li1, li2 = st.columns(2)
+    tgt = li1.number_input("Target price ($, optional)", min_value=0.0, value=0.0,
+                           step=1.0, key=f"{key_prefix}_logtgt")
+    stp = li2.number_input("Stop price ($, optional)", min_value=0.0, value=0.0,
+                           step=1.0, key=f"{key_prefix}_logstop")
+    note = st.text_input("Notes (optional)", key=f"{key_prefix}_lognote")
+    if st.button("Log this idea", key=f"{key_prefix}_log"):
+        log_trade(row, reg,
+                  target_price=round(tgt, 2) if tgt > 0 else "",
+                  stop_price=round(stp, 2) if stp > 0 else "",
+                  notes=note.strip())
+        st.success(f"Logged {pick} as an open idea — see the Ideas tab.")
 
     st.markdown("**Valuation & Analyst Reference** (live from EODHD)")
     with st.spinner("Pulling valuation..."):
@@ -343,7 +476,8 @@ else:
 
 top_n = st.sidebar.number_input("Show top N", 5, 50, 20)
 
-tab_scan, tab_search = st.tabs(["Full S&P Scan", "Search Any Ticker"])
+tab_scan, tab_search, tab_ideas = st.tabs(
+    ["Full S&P Scan", "Search Any Ticker", "Ideas"])
 
 with tab_scan:
     if st.button("Scan Full S&P 500", type="primary"):
@@ -353,7 +487,7 @@ with tab_scan:
         df = st.session_state["scan"]
         st.subheader(f"Top {len(df)} — ranked by your composite")
         show_table(df)
-        deep_dive(df, "scan")
+        deep_dive(df, "scan", reg)
     else:
         st.info("Click Scan Full S&P 500 to rank the whole index by your weights.")
 
@@ -379,4 +513,94 @@ with tab_search:
     if "search" in st.session_state:
         sdf = st.session_state["search"]
         show_table(sdf)
-        deep_dive(sdf, "search")
+        deep_dive(sdf, "search", reg)
+
+with tab_ideas:
+    st.subheader("Idea Tracker — live P&L")
+    st.caption("Open ideas are priced cache-first from EODHD; the composite is "
+               "recomputed against today's universe to check if the thesis held.")
+    log = load_trade_log()
+    if log.empty:
+        st.info("No ideas logged yet. Log one from the Deep Dive on the other tabs.")
+    else:
+        entry_num = pd.to_numeric(log["entry_price"], errors="coerce")
+        close_num = pd.to_numeric(log["close_price"], errors="coerce")
+        is_open = log["status"].astype(str).str.lower() == "open"
+        open_ideas = log[is_open]
+        closed = log[~is_open]
+
+        # ---- summary stats ----
+        cpnl = ((close_num - entry_num) / entry_num)[~is_open].dropna()
+        n_closed = int((~is_open).sum())
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Open ideas", int(is_open.sum()))
+        s2.metric("Closed", n_closed)
+        s3.metric("Win rate (closed)", f"{(cpnl > 0).mean():.0%}" if len(cpnl) else "—")
+        s4.metric("Avg P&L (closed)", f"{cpnl.mean():+.1%}" if len(cpnl) else "—")
+
+        # ---- open ideas ----
+        if open_ideas.empty:
+            st.caption("No open ideas.")
+        else:
+            weights = (w_mom, w_qual, w_val, w_trend)
+            with st.spinner("Pricing open ideas and recomputing factors..."):
+                uni = universe_factor_frame()
+            widths = [0.7, 0.5, 1.0, 1.0, 0.8, 0.9, 1.4, 0.8, 1.3, 0.7]
+            hdr = st.columns(widths)
+            for col, name in zip(hdr, ["Ticker", "Days", "Entry", "Current", "P&L",
+                                       "→Target", "Comp then→now", "Abv200d",
+                                       "Outcome note", ""]):
+                col.markdown(f"**{name}**")
+
+            for idx, idea in open_ideas.iterrows():
+                tkr = str(idea["ticker"]).strip()
+                live = idea_live(tkr, weights, uni)
+                cur, comp_now = live["price"], live["comp_now"]
+                entry = entry_num.get(idx)
+
+                try:
+                    days = (pd.Timestamp.now().normalize()
+                            - pd.to_datetime(idea["date"]).normalize()).days
+                except Exception:
+                    days = None
+                pnl = ((cur - entry) / entry
+                       if cur is not None and pd.notna(entry) and entry else None)
+                tgt = pd.to_numeric(pd.Series([idea["target_price"]]),
+                                    errors="coerce").iloc[0]
+                dist = (tgt / cur - 1) if cur and pd.notna(tgt) and tgt > 0 else None
+                comp_then = pd.to_numeric(pd.Series([idea["composite"]]),
+                                          errors="coerce").iloc[0]
+
+                rc = st.columns(widths)
+                rc[0].write(tkr)
+                rc[1].write(str(days) if days is not None else "—")
+                rc[2].write(f"${entry:.2f}" if pd.notna(entry) else "—")
+                rc[3].write(f"${cur:.2f}" if cur is not None else "—")
+                rc[4].write(f"{pnl:+.1%}" if pnl is not None else "—")
+                rc[5].write(f"{dist:+.1%}" if dist is not None else "—")
+                then_s = f"{comp_then:.2f}" if pd.notna(comp_then) else "—"
+                now_s = f"{comp_now:.2f}" if comp_now is not None else "—"
+                held = ""
+                if pd.notna(comp_then) and comp_now is not None:
+                    held = " ✅" if comp_now >= comp_then else " ⚠️"
+                rc[6].write(f"{then_s} → {now_s}{held}")
+                av = str(idea["above_200d"]).strip()
+                rc[7].write(av if av else "—")
+                note_val = rc[8].text_input("note", key=f"note_{idx}",
+                                            label_visibility="collapsed")
+                if rc[9].button("Close", key=f"close_{idx}"):
+                    close_idea(idx, cur, note_val.strip())
+                    st.success(f"Closed {tkr}.")
+                    st.rerun()
+
+        # ---- closed ideas ----
+        if n_closed > 0:
+            st.markdown("**Closed ideas**")
+            sc = closed.copy()
+            sc["pnl"] = ((close_num - entry_num) / entry_num)[~is_open].values
+            st.dataframe(
+                sc[["date", "ticker", "entry_price", "close_date", "close_price",
+                    "pnl", "outcome_note"]].style.format(
+                    {"entry_price": "${:.2f}", "close_price": "${:.2f}",
+                     "pnl": "{:+.1%}"}, na_rep="—"),
+                use_container_width=True)
