@@ -12,6 +12,7 @@ from pit_factors import pit_fscore, pit_value_inputs
 from screener import get_regime_weights
 
 PRICE_DIR = "data/universe_prices"
+SCAN_HISTORY_DIR = "data/scan_history"
 TRADE_LOG = "trade_log.csv"
 YEAR = datetime.now().year
 
@@ -195,7 +196,9 @@ def make_thesis(row):
 
 
 # ---------- Full S&P scan ----------
-def full_scan(w_mom, w_qual, w_val, w_trend, top_n):
+def scan_universe(w_mom, w_qual, w_val, w_trend):
+    """Score and rank EVERY current S&P member by the given weights.
+    Returns the full ranked frame (rank 1 = best) — callers trim as needed."""
     prices_all = load_prices()
     members = current_members()
     rows = []
@@ -207,7 +210,136 @@ def full_scan(w_mom, w_qual, w_val, w_trend, top_n):
             rows.append(r)
     df = pd.DataFrame(rows).dropna(subset=["momentum"])
     df = add_zscores(df, w_mom, w_qual, w_val, w_trend)
-    return df.head(top_n)
+    df["rank"] = range(1, len(df) + 1)
+    return df
+
+
+def full_scan(w_mom, w_qual, w_val, w_trend, top_n):
+    return scan_universe(w_mom, w_qual, w_val, w_trend).head(top_n)
+
+
+# ---------- Flagging engine (scan history + diffs) ----------
+SNAPSHOT_COLS = ["date", "Ticker", "price", "momentum", "trend",
+                 "fscore", "earn_yield", "composite", "rank", "regime"]
+
+
+def save_snapshot(scored, date_str, regime):
+    """Persist a ranked scan to data/scan_history/{date}.csv (overwrites same-day)."""
+    os.makedirs(SCAN_HISTORY_DIR, exist_ok=True)
+    snap = scored[["Ticker", "price", "momentum", "trend",
+                   "fscore", "earn_yield", "composite", "rank"]].copy()
+    snap.insert(0, "date", date_str)
+    snap["regime"] = regime
+    snap[SNAPSHOT_COLS].to_csv(f"{SCAN_HISTORY_DIR}/{date_str}.csv", index=False)
+
+
+def prior_snapshot(before_date):
+    """Most recent saved snapshot strictly before `before_date`.
+    Returns (date_str, frame) or (None, None) if there is no earlier scan."""
+    if not os.path.isdir(SCAN_HISTORY_DIR):
+        return None, None
+    dates = sorted(f[:-4] for f in os.listdir(SCAN_HISTORY_DIR)
+                   if f.endswith(".csv"))
+    earlier = [d for d in dates if d < before_date]
+    if not earlier:
+        return None, None
+    d = earlier[-1]
+    return d, pd.read_csv(f"{SCAN_HISTORY_DIR}/{d}.csv")
+
+
+def compute_flags(scored, prior_df, prior_date, top_n=20):
+    """Diff today's ranked scan against the prior snapshot.
+
+    Returns a dict with four lists. New/trend/movers items are (row, reason)
+    where row is the live scored Series (has z-scores for make_thesis and every
+    field log_trade needs). Dropped items are (ticker, row_or_None, reason)."""
+    by_tkr = scored.set_index("Ticker", drop=False)
+    p = prior_df.set_index("Ticker")
+    today_top = set(scored[scored["rank"] <= top_n]["Ticker"])
+    prior_top = set(prior_df[prior_df["rank"] <= top_n]["Ticker"])
+
+    # 1. NEW ENTRANTS — in today's top N, not in the prior top N.
+    new_entrants = []
+    for tk in scored[scored["rank"] <= top_n].sort_values("rank")["Ticker"]:
+        if tk not in prior_top:
+            row = by_tkr.loc[tk]
+            was = f"was #{int(p.loc[tk, 'rank'])}" if tk in p.index else "not in prior scan"
+            new_entrants.append((row, f"Entered top {top_n} at #{int(row['rank'])} ({was})."))
+
+    # 2. TREND CONFIRMATIONS — F-score >= 7 AND crossed above 200d MA since last scan.
+    trend_conf = []
+    for tk in scored["Ticker"]:
+        row = by_tkr.loc[tk]
+        if (tk in p.index and pd.notna(row["fscore"]) and row["fscore"] >= 7
+                and pd.notna(row["trend"]) and row["trend"] > 0):
+            prev = p.loc[tk, "trend"]
+            if pd.notna(prev) and prev <= 0:
+                trend_conf.append((row, f"F-score {row['fscore']:.0f}/9 and crossed "
+                                        f"above its 200d MA ({prev:+.0%} → {row['trend']:+.0%}) "
+                                        f"since {prior_date}."))
+
+    # 3. BIG MOVERS — top 5 composite-score increases vs the prior scan.
+    deltas = []
+    for tk in scored["Ticker"]:
+        if tk in p.index:
+            d = float(by_tkr.loc[tk, "composite"] - p.loc[tk, "composite"])
+            deltas.append((tk, d))
+    deltas.sort(key=lambda x: x[1], reverse=True)
+    big_movers = []
+    for tk, d in deltas[:5]:
+        if d <= 0:
+            break  # only surface genuine increases
+        row = by_tkr.loc[tk]
+        big_movers.append((row, f"Composite {d:+.2f} ({p.loc[tk, 'composite']:.2f} → "
+                                f"{row['composite']:.2f}) since {prior_date}."))
+
+    # 4. DROPPED OUT — were in the prior top N, not in today's top N.
+    dropped = []
+    for tk in sorted(prior_top - today_top):
+        if tk in by_tkr.index:
+            row = by_tkr.loc[tk]
+            reason = (f"Fell out of top {top_n}: was #{int(p.loc[tk, 'rank'])}, "
+                      f"now #{int(row['rank'])}.")
+        else:
+            row = None
+            reason = (f"Was #{int(p.loc[tk, 'rank'])} in the prior top {top_n}; "
+                      f"no longer in the scan.")
+        dropped.append((tk, row, reason))
+
+    return {"new": new_entrants, "trend": trend_conf,
+            "movers": big_movers, "dropped": dropped}
+
+
+def render_flags(title, items, reg, key):
+    """Render one flag category: ticker, composite now, reason, thesis, log button."""
+    st.markdown(f"#### {title}")
+    if not items:
+        st.caption("Nothing flagged.")
+        return
+    widths = [0.8, 1.0, 3.0, 4.5, 1.4]
+    for i, (row, reason) in enumerate(items):
+        c = st.columns(widths)
+        c[0].markdown(f"**{row['Ticker']}**")
+        c[1].write(f"{row['composite']:.2f}")
+        c[2].write(reason)
+        c[3].caption(make_thesis(row))
+        if c[4].button("Log this idea", key=f"{key}_{i}_{row['Ticker']}"):
+            log_trade(row, reg, notes=f"Flagged ({title})")
+            st.success(f"Logged {row['Ticker']} — see the Ideas tab.")
+
+
+def render_dropped(items):
+    """Dropped-out flag: ticker, composite now (if still scanned), reason. No log button."""
+    st.markdown("#### Dropped Out")
+    if not items:
+        st.caption("Nothing flagged.")
+        return
+    widths = [0.8, 1.0, 6.0]
+    for tk, row, reason in items:
+        c = st.columns(widths)
+        c[0].markdown(f"**{tk}**")
+        c[1].write(f"{row['composite']:.2f}" if row is not None else "—")
+        c[2].write(reason)
 
 
 # ---------- Trade log ----------
@@ -476,8 +608,8 @@ else:
 
 top_n = st.sidebar.number_input("Show top N", 5, 50, 20)
 
-tab_scan, tab_search, tab_ideas = st.tabs(
-    ["Full S&P Scan", "Search Any Ticker", "Ideas"])
+tab_scan, tab_flags, tab_search, tab_ideas = st.tabs(
+    ["Full S&P Scan", "Flags", "Search Any Ticker", "Ideas"])
 
 with tab_scan:
     if st.button("Scan Full S&P 500", type="primary"):
@@ -490,6 +622,59 @@ with tab_scan:
         deep_dive(df, "scan", reg)
     else:
         st.info("Click Scan Full S&P 500 to rank the whole index by your weights.")
+
+with tab_flags:
+    st.subheader("Proactive Flags")
+    st.caption("Each run refreshes prices, rescans the whole S&P 500 with the "
+               "current regime weights, saves a dated snapshot, and diffs it "
+               "against the most recent prior snapshot to surface opportunities.")
+
+    if st.button("Run flag scan (refreshes prices — ~5 min)", type="primary"):
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        status = st.status("Refreshing S&P 500 prices before scanning...")
+        refresh_prices(current_members(), status)
+        status.update(label="Prices refreshed — scoring universe with regime weights...")
+        # Always score with the CURRENT regime's weights (not the sliders).
+        rw = reg["weights"]
+        scored = scan_universe(rw["momentum"], rw["quality"], rw["value"], rw["trend"])
+        # Capture the comparison snapshot BEFORE writing today's (strict date <).
+        pdate, pdf = prior_snapshot(today_str)
+        save_snapshot(scored, today_str, reg["regime"])
+        status.update(label=f"Scan complete — {len(scored)} stocks ranked.",
+                      state="complete")
+        st.session_state["flag_scan"] = {
+            "scored": scored, "prior_date": pdate, "prior_df": pdf,
+            "date": today_str, "regime": reg["regime"], "weights": rw}
+
+    if "flag_scan" not in st.session_state:
+        st.info("Click Run flag scan to detect new entrants, trend confirmations, "
+                "big movers, and drop-outs versus your last scan.")
+    else:
+        fs = st.session_state["flag_scan"]
+        scored, pdf, pdate = fs["scored"], fs["prior_df"], fs["prior_date"]
+        w = fs["weights"]
+        weight_str = (f"momentum {w['momentum']:.2f} · quality {w['quality']:.2f} · "
+                      f"value {w['value']:.2f} · trend {w['trend']:.2f}")
+
+        h1, h2 = st.columns(2)
+        h1.markdown(f"**Regime:** {fs['regime']}  \n**Active weights:** {weight_str}")
+        cmp_txt = pdate if pdate else "— (no prior scan)"
+        h2.markdown(f"**This scan:** {fs['date']}  \n**Compared against:** {cmp_txt}")
+
+        if pdf is None:
+            st.success("Baseline saved — flags appear on next scan.")
+            st.markdown("**Today's top 20 (baseline)**")
+            show_table(scored.head(20))
+        else:
+            prev_regime = str(pdf["regime"].iloc[0]) if "regime" in pdf.columns and len(pdf) else None
+            if prev_regime and prev_regime != fs["regime"]:
+                st.warning(f"Regime changed since last scan ({prev_regime} → {fs['regime']}). "
+                           f"Composite deltas below span two different weight sets.")
+            flags = compute_flags(scored, pdf, pdate, top_n=20)
+            render_flags("New Entrants", flags["new"], reg, "flag_new")
+            render_flags("Trend Confirmations", flags["trend"], reg, "flag_trend")
+            render_flags("Big Movers", flags["movers"], reg, "flag_mover")
+            render_dropped(flags["dropped"])
 
 with tab_search:
     q = st.text_input("Enter any US ticker(s), comma-separated",
