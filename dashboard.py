@@ -133,11 +133,25 @@ def compute_factors(t, prices_all):
             "trend": tr, "fscore": fs, "earn_yield": ey, "_series": s}
 
 
+def winsorize(s, lower=0.01, upper=0.99):
+    """Cap a factor series at its 1st/99th percentiles before z-scoring so a
+    genuine extreme outlier (e.g. SNDK's real +3,982% momentum) can't dominate
+    the composite and crush everything else's relative score. Values are capped
+    to the bounds, never dropped, and NaNs pass through untouched — so the
+    outlier stays pinned at the top of its factor, just no longer at an absurd
+    z-distance from the field."""
+    valid = s.dropna()
+    if len(valid) < 2:
+        return s
+    lo, hi = valid.quantile(lower), valid.quantile(upper)
+    return s.clip(lower=lo, upper=hi)
+
+
 def add_zscores(df, w_mom, w_qual, w_val, w_trend):
     n = len(df)
     def z(col):
         if n > 1:
-            return zscore(df[col]).fillna(0)
+            return zscore(winsorize(df[col])).fillna(0)
         return pd.Series(0.0, index=df.index)
     df["z_mom"] = z("momentum")
     df["z_qual"] = z("fscore")
