@@ -1,4 +1,12 @@
 config.py
 venv/
-data/
 __pycache__/
+
+# Ignore everything under data/ (prices & fundamentals are large and
+# regenerable) EXCEPT the flagging engine's scan-history snapshots, which are
+# small and must survive machine wipes so the diff has memory.
+data/*
+!data/scan_history/
+data/scan_history/*
+!data/scan_history/*.csv
+!data/scan_history/.gitkeep
