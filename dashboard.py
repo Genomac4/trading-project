@@ -538,10 +538,21 @@ def deep_dive(df, key_prefix, reg):
         rating = val.get("analyst_rating")
         if target and row["price"]:
             upside = (target / row["price"]) - 1
-            st.caption(f"Analyst consensus: target ${target:.0f} ({upside:+.1%} vs current) | "
-                       f"rating {rating:.2f}/5 "
-                       f"(SB:{val.get('strong_buy')} B:{val.get('buy')} "
-                       f"H:{val.get('hold')} S:{val.get('sell')})")
+            st.markdown("### 🎯 Analyst Consensus")
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Consensus target", f"${target:.0f}",
+                      f"{upside:+.1%} vs current", delta_color="normal")
+            a2.metric("Rating", f"{rating:.2f}/5" if rating else "—",
+                      help="EODHD consensus: 1 = Strong Buy … 5 = Strong Sell")
+            sb, b, h, s = (val.get("strong_buy"), val.get("buy"),
+                           val.get("hold"), val.get("sell"))
+            n_analysts = sum(int(x) for x in (sb, b, h, s)
+                             if isinstance(x, (int, float)))
+            a3.metric("Analysts covering", str(n_analysts) if n_analysts else "—")
+            st.markdown(
+                f"**Ratings breakdown:**   "
+                f":green[**Strong Buy {sb}**] · :green[**Buy {b}**] · "
+                f"**Hold {h}** · :red[**Sell {s}**]")
 
         your_target = st.number_input("Your price target ($)", min_value=0.0,
                                       value=0.0, step=5.0, key=f"{key_prefix}_tgt")
@@ -775,7 +786,11 @@ with tab_ideas:
                 rc[1].write(str(days) if days is not None else "—")
                 rc[2].write(f"${entry:.2f}" if pd.notna(entry) else "—")
                 rc[3].write(f"${cur:.2f}" if cur is not None else "—")
-                rc[4].write(f"{pnl:+.1%}" if pnl is not None else "—")
+                if pnl is None:
+                    rc[4].write("—")
+                else:
+                    pcolor = "green" if pnl > 0 else "red" if pnl < 0 else "gray"
+                    rc[4].markdown(f":{pcolor}[**{pnl:+.1%}**]")
                 rc[5].write(f"{dist:+.1%}" if dist is not None else "—")
                 then_s = f"{comp_then:.2f}" if pd.notna(comp_then) else "—"
                 now_s = f"{comp_now:.2f}" if comp_now is not None else "—"
@@ -797,9 +812,18 @@ with tab_ideas:
             st.markdown("**Closed ideas**")
             sc = closed.copy()
             sc["pnl"] = ((close_num - entry_num) / entry_num)[~is_open].values
+
+            def pnl_color(v):
+                if pd.isna(v):
+                    return "color: gray"
+                return ("color: #16a34a" if v > 0            # green
+                        else "color: #dc2626" if v < 0       # red
+                        else "color: gray")
+
             st.dataframe(
                 sc[["date", "ticker", "entry_price", "close_date", "close_price",
                     "pnl", "outcome_note"]].style.format(
                     {"entry_price": "${:.2f}", "close_price": "${:.2f}",
-                     "pnl": "{:+.1%}"}, na_rep="—"),
+                     "pnl": "{:+.1%}"}, na_rep="—")
+                    .map(pnl_color, subset=["pnl"]),
                 use_container_width=True)
