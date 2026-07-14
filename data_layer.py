@@ -221,6 +221,62 @@ def get_valuation(ticker, max_age_hours=FUNDAMENTALS_MAX_AGE_HOURS):
     print(f"[{ticker}] Pulled and saved valuation")
     return result
 
+# ---- Sector (cached per ticker) ----
+SECTOR_CACHE = "data/sectors.csv"
+# In-memory mirror of the CSV so a full-universe scan doesn't re-read the file
+# once per ticker. Lazily loaded on first use; persists across Streamlit reruns.
+_sector_mem = None
+
+
+def _load_sector_cache():
+    global _sector_mem
+    if _sector_mem is None:
+        _sector_mem = {}
+        if os.path.exists(SECTOR_CACHE):
+            try:
+                df = pd.read_csv(SECTOR_CACHE)
+                _sector_mem = {str(t).upper(): str(s)
+                               for t, s in zip(df["ticker"], df["sector"])}
+            except Exception:
+                _sector_mem = {}
+    return _sector_mem
+
+
+def _save_sector_cache(cache):
+    os.makedirs("data", exist_ok=True)
+    (pd.DataFrame(sorted(cache.items()), columns=["ticker", "sector"])
+     .to_csv(SECTOR_CACHE, index=False))
+
+
+def get_sector(ticker):
+    """Return the EODHD General.Sector for a ticker, cache-first.
+
+    Reads the local sector cache; on a miss, pulls just the General.Sector field
+    from EODHD and stores it. Anything missing or a failed request resolves to
+    'Unknown' — and that result is cached too, so an unknown ticker isn't
+    re-pulled on every scan."""
+    ticker = ticker.upper()
+    cache = _load_sector_cache()
+    if ticker in cache:
+        return cache[ticker]
+
+    sector = "Unknown"
+    try:
+        url = (f"https://eodhd.com/api/fundamentals/{ticker}.US"
+               f"?api_token={EODHD_API_KEY}&fmt=json&filter=General::Sector")
+        resp = requests.get(url, timeout=30)
+        if resp.status_code == 200:
+            val = resp.json()
+            if isinstance(val, str) and val.strip():
+                sector = val.strip()
+    except Exception:
+        pass
+
+    cache[ticker] = sector
+    _save_sector_cache(cache)
+    return sector
+
+
 # ---- Test (runs only when this file is run directly) ----
 if __name__ == "__main__":
     pd.set_option("display.max_columns", None)

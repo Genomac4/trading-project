@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime
 from config import EODHD_API_KEY
-from data_layer import get_valuation
+from data_layer import get_valuation, get_sector
 from explore_constituents import get_sp500_membership
 from backtest_composite import cached_fscore, cached_value, zscore
 from pit_factors import pit_fscore, pit_value_inputs
@@ -130,7 +130,8 @@ def compute_factors(t, prices_all):
         if mc > 0:
             ey = vi["net_income"] / mc
     return {"Ticker": t, "price": p_now, "momentum": mom,
-            "trend": tr, "fscore": fs, "earn_yield": ey, "_series": s}
+            "trend": tr, "fscore": fs, "earn_yield": ey,
+            "sector": get_sector(t), "_series": s}
 
 
 def winsorize(s, lower=0.01, upper=0.99):
@@ -160,6 +161,33 @@ def add_zscores(df, w_mom, w_qual, w_val, w_trend):
     df["composite"] = (w_mom * df["z_mom"] + w_qual * df["z_qual"]
                        + w_val * df["z_val"] + w_trend * df["z_trend"])
     return df.sort_values("composite", ascending=False).reset_index(drop=True)
+
+
+# ---------- Post-ranking selection ----------
+def select_top(ranked, top_n, diversify=False, cap=2):
+    """Trim a composite-sorted frame to the top_n selection.
+
+    diversify=False -> pure composite rank: the head of the frame.
+    diversify=True  -> walk the composite-sorted list top-down and keep each
+    name unless its sector already has `cap` picks, yielding the highest-
+    composite names spread across sectors instead of clustered in one. This is a
+    pure post-ranking filter — it never touches the composite or its ordering.
+
+    Assumes `ranked` is already sorted by composite descending (as returned by
+    add_zscores / scan_universe). A missing sector counts as 'Unknown'."""
+    if not diversify:
+        return ranked.head(top_n)
+    counts, keep = {}, []
+    for idx, row in ranked.iterrows():
+        sec = row.get("sector")
+        sec = sec if isinstance(sec, str) and sec else "Unknown"
+        if counts.get(sec, 0) >= cap:
+            continue
+        counts[sec] = counts.get(sec, 0) + 1
+        keep.append(idx)
+        if len(keep) >= top_n:
+            break
+    return ranked.loc[keep]
 
 
 # ---------- Regime ----------
@@ -228,19 +256,20 @@ def scan_universe(w_mom, w_qual, w_val, w_trend):
     return df
 
 
-def full_scan(w_mom, w_qual, w_val, w_trend, top_n):
-    return scan_universe(w_mom, w_qual, w_val, w_trend).head(top_n)
+def full_scan(w_mom, w_qual, w_val, w_trend, top_n, diversify=False, cap=2):
+    ranked = scan_universe(w_mom, w_qual, w_val, w_trend)
+    return select_top(ranked, top_n, diversify, cap)
 
 
 # ---------- Flagging engine (scan history + diffs) ----------
-SNAPSHOT_COLS = ["date", "Ticker", "price", "momentum", "trend",
+SNAPSHOT_COLS = ["date", "Ticker", "sector", "price", "momentum", "trend",
                  "fscore", "earn_yield", "composite", "rank", "regime"]
 
 
 def save_snapshot(scored, date_str, regime):
     """Persist a ranked scan to data/scan_history/{date}.csv (overwrites same-day)."""
     os.makedirs(SCAN_HISTORY_DIR, exist_ok=True)
-    snap = scored[["Ticker", "price", "momentum", "trend",
+    snap = scored[["Ticker", "sector", "price", "momentum", "trend",
                    "fscore", "earn_yield", "composite", "rank"]].copy()
     snap.insert(0, "date", date_str)
     snap["regime"] = regime
@@ -261,20 +290,34 @@ def prior_snapshot(before_date):
     return d, pd.read_csv(f"{SCAN_HISTORY_DIR}/{d}.csv")
 
 
-def compute_flags(scored, prior_df, prior_date, top_n=20):
+def compute_flags(scored, prior_df, prior_date, top_n=20, diversify=False, cap=2):
     """Diff today's ranked scan against the prior snapshot.
 
     Returns a dict with four lists. New/trend/movers items are (row, reason)
     where row is the live scored Series (has z-scores for make_thesis and every
-    field log_trade needs). Dropped items are (ticker, row_or_None, reason)."""
+    field log_trade needs). Dropped items are (ticker, row_or_None, reason).
+
+    When diversify is on, "top N" means the sector-diversified selection (max
+    `cap` per sector) on BOTH sides of the diff, so new entrants / drop-outs are
+    computed against the same filter the user is looking at."""
     by_tkr = scored.set_index("Ticker", drop=False)
     p = prior_df.set_index("Ticker")
-    today_top = set(scored[scored["rank"] <= top_n]["Ticker"])
-    prior_top = set(prior_df[prior_df["rank"] <= top_n]["Ticker"])
+
+    # Older snapshots predate the sector column; backfill it (cache-first) so the
+    # prior top-N is diversified the same way as today's.
+    prior_sorted = prior_df.sort_values("composite", ascending=False)
+    if "sector" not in prior_sorted.columns:
+        prior_sorted = prior_sorted.copy()
+        prior_sorted["sector"] = prior_sorted["Ticker"].map(get_sector)
+
+    today_sel = select_top(scored, top_n, diversify, cap)
+    prior_sel = select_top(prior_sorted, top_n, diversify, cap)
+    today_top = set(today_sel["Ticker"])
+    prior_top = set(prior_sel["Ticker"])
 
     # 1. NEW ENTRANTS — in today's top N, not in the prior top N.
     new_entrants = []
-    for tk in scored[scored["rank"] <= top_n].sort_values("rank")["Ticker"]:
+    for tk in today_sel["Ticker"]:
         if tk not in prior_top:
             row = by_tkr.loc[tk]
             was = f"was #{int(p.loc[tk, 'rank'])}" if tk in p.index else "not in prior scan"
@@ -330,14 +373,15 @@ def render_flags(title, items, reg, key):
     if not items:
         st.caption("Nothing flagged.")
         return
-    widths = [0.8, 1.0, 3.0, 4.5, 1.4]
+    widths = [0.8, 1.4, 1.0, 3.0, 4.0, 1.4]
     for i, (row, reason) in enumerate(items):
         c = st.columns(widths)
         c[0].markdown(f"**{row['Ticker']}**")
-        c[1].write(f"{row['composite']:.2f}")
-        c[2].write(reason)
-        c[3].caption(make_thesis(row))
-        if c[4].button("Log this idea", key=f"{key}_{i}_{row['Ticker']}"):
+        c[1].caption(str(row.get("sector") or "Unknown"))
+        c[2].write(f"{row['composite']:.2f}")
+        c[3].write(reason)
+        c[4].caption(make_thesis(row))
+        if c[5].button("Log this idea", key=f"{key}_{i}_{row['Ticker']}"):
             log_trade(row, reg, notes=f"Flagged ({title})")
             st.success(f"Logged {row['Ticker']} — see the Ideas tab.")
 
@@ -348,12 +392,14 @@ def render_dropped(items):
     if not items:
         st.caption("Nothing flagged.")
         return
-    widths = [0.8, 1.0, 6.0]
+    widths = [0.8, 1.4, 1.0, 5.0]
     for tk, row, reason in items:
         c = st.columns(widths)
         c[0].markdown(f"**{tk}**")
-        c[1].write(f"{row['composite']:.2f}" if row is not None else "—")
-        c[2].write(reason)
+        sec = str(row.get("sector") or "Unknown") if row is not None else get_sector(tk)
+        c[1].caption(sec)
+        c[2].write(f"{row['composite']:.2f}" if row is not None else "—")
+        c[3].write(reason)
 
 
 # ---------- Trade log ----------
@@ -580,7 +626,9 @@ def deep_dive(df, key_prefix, reg):
 
 
 def show_table(df):
-    show = df[["Ticker", "price", "composite", "momentum", "trend", "fscore", "earn_yield"]]
+    cols = ["Ticker", "sector", "price", "composite",
+            "momentum", "trend", "fscore", "earn_yield"]
+    show = df[[c for c in cols if c in df.columns]]
     st.dataframe(show.style.format({
         "price": "${:.2f}", "composite": "{:.2f}", "momentum": "{:+.1%}",
         "trend": "{:+.1%}", "fscore": "{:.0f}", "earn_yield": "{:.1%}",
@@ -633,16 +681,31 @@ else:
 
 top_n = st.sidebar.number_input("Show top N", 5, 50, 20)
 
+# Post-ranking selection filter: spread the top N across sectors instead of
+# letting one hot sector (e.g. semis) dominate. OFF = pure composite rank.
+diversify = st.sidebar.checkbox("Diversify by sector (max N per sector)", value=False,
+                                help="Walk the composite-ranked list and skip any "
+                                     "stock whose sector already has N picks, so you "
+                                     "get the best name per sector, not N of the same trade.")
+sector_cap = st.sidebar.number_input("Max per sector", 1, 10, 2, disabled=not diversify)
+if diversify:
+    st.sidebar.info(f"Sector diversification ON — max {int(sector_cap)} per sector.")
+
 tab_scan, tab_flags, tab_search, tab_ideas = st.tabs(
     ["Full S&P Scan", "Flags", "Search Any Ticker", "Ideas"])
 
 with tab_scan:
     if st.button("Scan Full S&P 500", type="primary"):
         with st.spinner("Scanning ~500 stocks from cached data..."):
-            st.session_state["scan"] = full_scan(w_mom, w_qual, w_val, w_trend, top_n)
+            st.session_state["scan"] = full_scan(w_mom, w_qual, w_val, w_trend,
+                                                 top_n, diversify, sector_cap)
     if "scan" in st.session_state:
         df = st.session_state["scan"]
-        st.subheader(f"Top {len(df)} — ranked by your composite")
+        if diversify:
+            st.subheader(f"Top {len(df)} — composite rank, diversified "
+                         f"(max {int(sector_cap)} per sector)")
+        else:
+            st.subheader(f"Top {len(df)} — ranked by your composite")
         show_table(df)
         deep_dive(df, "scan", reg)
     else:
@@ -686,16 +749,20 @@ with tab_flags:
         cmp_txt = pdate if pdate else "— (no prior scan)"
         h2.markdown(f"**This scan:** {fs['date']}  \n**Compared against:** {cmp_txt}")
 
+        if diversify:
+            st.caption(f"Sector diversification ON — top-N membership below is the "
+                       f"best {int(sector_cap)} name(s) per sector.")
         if pdf is None:
             st.success("Baseline saved — flags appear on next scan.")
             st.markdown("**Today's top 20 (baseline)**")
-            show_table(scored.head(20))
+            show_table(select_top(scored, 20, diversify, sector_cap))
         else:
             prev_regime = str(pdf["regime"].iloc[0]) if "regime" in pdf.columns and len(pdf) else None
             if prev_regime and prev_regime != fs["regime"]:
                 st.warning(f"Regime changed since last scan ({prev_regime} → {fs['regime']}). "
                            f"Composite deltas below span two different weight sets.")
-            flags = compute_flags(scored, pdf, pdate, top_n=20)
+            flags = compute_flags(scored, pdf, pdate, top_n=20,
+                                  diversify=diversify, cap=sector_cap)
             render_flags("New Entrants", flags["new"], reg, "flag_new")
             render_flags("Trend Confirmations", flags["trend"], reg, "flag_trend")
             render_flags("Big Movers", flags["movers"], reg, "flag_mover")
