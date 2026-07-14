@@ -10,3 +10,9 @@ data/*
 data/scan_history/*
 !data/scan_history/*.csv
 !data/scan_history/.gitkeep
+# The paper portfolio's rebalance ledger is the whole point — it must survive
+# machine wipes, so track it like the scan-history snapshots.
+!data/paper_portfolio/
+data/paper_portfolio/*
+!data/paper_portfolio/*.csv
+!data/paper_portfolio/.gitkeep
