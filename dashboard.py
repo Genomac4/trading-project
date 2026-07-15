@@ -635,22 +635,33 @@ def show_table(df):
     }, na_rep="—"), use_container_width=True)
 
 
-# ---------- Paper portfolio (one basket vs SPY over time) ----------
+# ---------- Paper portfolios (two named tracks vs SPY over time) ----------
 PAPER_DIR = "data/paper_portfolio"
-REBALANCES_CSV = f"{PAPER_DIR}/rebalances.csv"
 REBAL_COLS = ["date", "regime", "tickers", "entry_prices", "weights"]
 PORTFOLIO_BASKET_N = 30
 START_CAPITAL = 10_000.0
 REBALANCE_MIN_DAYS = 25  # monthly cadence guard
 
+# Two tracks run head-to-head from the same inception: same universe scan, same
+# regime weights, different post-ranking selection filter. Each has its own file.
+TRACKS = {
+    "concentrated": {"label": "Concentrated", "diversify": False, "cap": 2},
+    "diversified": {"label": "Diversified", "diversify": True, "cap": 2},
+}
 
-def load_rebalances():
-    """Raw rebalance ledger as a frame (one row per rebalance). Always the
-    REBAL_COLS schema; empty frame if the portfolio hasn't been started."""
-    if not os.path.exists(REBALANCES_CSV):
+
+def rebalances_path(track):
+    return f"{PAPER_DIR}/{track}.csv"
+
+
+def load_rebalances(track):
+    """Raw rebalance ledger for one track as a frame (one row per rebalance).
+    Always the REBAL_COLS schema; empty frame if the track hasn't been started."""
+    path = rebalances_path(track)
+    if not os.path.exists(path):
         return pd.DataFrame(columns=REBAL_COLS)
     try:
-        df = pd.read_csv(REBALANCES_CSV, dtype=str)
+        df = pd.read_csv(path, dtype=str)
     except Exception:
         return pd.DataFrame(columns=REBAL_COLS)
     for col in REBAL_COLS:
@@ -659,10 +670,10 @@ def load_rebalances():
     return df[REBAL_COLS]
 
 
-def parse_rebalances():
-    """Rebalances as a date-sorted list of dicts with parsed holding lists:
-    {date, regime, tickers:[...], entry_prices:[float], weights:[float]}."""
-    df = load_rebalances()
+def parse_rebalances(track):
+    """One track's rebalances as a date-sorted list of dicts with parsed holding
+    lists: {date, regime, tickers:[...], entry_prices:[float], weights:[float]}."""
+    df = load_rebalances(track)
     out = []
     for _, r in df.iterrows():
         tickers = [t for t in str(r["tickers"]).split("|") if t]
@@ -685,9 +696,9 @@ def parse_rebalances():
     return out
 
 
-def save_rebalance(date_str, selected, regime):
-    """Append (or same-day overwrite) a rebalance snapshot. `selected` is the
-    ranked top-N frame with Ticker + price; holdings are equal-weighted."""
+def save_rebalance(track, date_str, selected, regime):
+    """Append (or same-day overwrite) a rebalance snapshot to a track's file.
+    `selected` is the ranked top-N frame with Ticker + price; equal-weighted."""
     os.makedirs(PAPER_DIR, exist_ok=True)
     tickers = list(selected["Ticker"])
     prices = [round(float(p), 4) for p in selected["price"]]
@@ -699,10 +710,10 @@ def save_rebalance(date_str, selected, regime):
         "entry_prices": "|".join(str(p) for p in prices),
         "weights": "|".join(str(w) for _ in tickers),
     }
-    df = load_rebalances()
+    df = load_rebalances(track)
     df = df[df["date"] != date_str]  # same-day rebalance replaces
     df = pd.concat([df, pd.DataFrame([row], columns=REBAL_COLS)], ignore_index=True)
-    df.sort_values("date").to_csv(REBALANCES_CSV, index=False)
+    df.sort_values("date").to_csv(rebalances_path(track), index=False)
 
 
 def _asof(index, ts):
@@ -946,15 +957,54 @@ with tab_flags:
             render_flags("Big Movers", flags["movers"], reg, "flag_mover")
             render_dropped(flags["dropped"])
 
-with tab_portfolio:
-    st.subheader("Paper Portfolio — the strategy as one basket vs SPY")
-    st.caption(f"Equal-weight top {PORTFOLIO_BASKET_N} by composite (current "
-               f"regime weights, winsorized, sector-diversify toggle respected), "
-               f"rebalanced monthly, tracked from inception at "
-               f"${START_CAPITAL:,.0f}. The live proving ground before real capital.")
+def render_track_detail(rebs, prices_all):
+    """Per-track holdings (P&L since last rebalance) + rebalance history."""
+    ldate = rebs[-1]["date"]
+    st.markdown(f"**Current holdings — since last rebalance ({ldate})**")
+    last = rebs[-1]
+    hrows = []
+    for tk, entry, wt in zip(last["tickers"], last["entry_prices"], last["weights"]):
+        cur = None
+        if tk in prices_all.columns:
+            s = prices_all[tk].dropna()
+            if len(s) > 0:
+                cur = float(s.iloc[-1])
+        pnl = ((cur / entry) - 1) if (cur is not None and entry) else None
+        hrows.append({
+            "Ticker": tk,
+            "Entry": f"${entry:.2f}" if entry else "—",
+            "Current": f"${cur:.2f}" if cur is not None else "—",
+            "P&L": f"{pnl:+.1%}" if pnl is not None else "—",
+            "Weight": f"{wt:.1%}" if wt is not None else "—",
+        })
+    st.dataframe(pd.DataFrame(hrows), use_container_width=True, hide_index=True)
 
-    rebs = parse_rebalances()
-    last_date = rebs[-1]["date"] if rebs else None
+    st.markdown("**Rebalance history**")
+    hist = []
+    for r in reversed(rebs):
+        tickers = r["tickers"]
+        preview = ", ".join(tickers[:8]) + (" …" if len(tickers) > 8 else "")
+        hist.append({"Date": r["date"], "Regime": r["regime"],
+                     "Holdings": len(tickers), "Tickers": preview})
+    st.dataframe(pd.DataFrame(hist), use_container_width=True, hide_index=True)
+
+
+with tab_portfolio:
+    st.subheader("Paper Portfolios — concentrated vs diversified vs SPY")
+    st.caption(f"Two equal-weight top-{PORTFOLIO_BASKET_N} baskets from the SAME "
+               f"scan (current regime weights, winsorized), rebalanced monthly "
+               f"from a shared inception at ${START_CAPITAL:,.0f}: "
+               f"**Concentrated** (pure composite rank) vs **Diversified** "
+               f"(max {TRACKS['diversified']['cap']} per sector). The live "
+               f"head-to-head before real capital.")
+
+    track_rebs = {t: parse_rebalances(t) for t in TRACKS}
+    any_started = any(track_rebs[t] for t in TRACKS)
+
+    # Both tracks rebalance together, so cadence is judged off the latest date
+    # across either file.
+    all_last = [r[-1]["date"] for r in track_rebs.values() if r]
+    last_date = max(all_last) if all_last else None
     days_since = None
     if last_date:
         try:
@@ -962,106 +1012,101 @@ with tab_portfolio:
                           - datetime.strptime(last_date, "%Y-%m-%d").date()).days
         except Exception:
             days_since = None
-
-    # --- Start / Rebalance control ---
-    btn_label = "Rebalance Portfolio (monthly)" if rebs else "Start Portfolio"
     too_soon = (days_since is not None and days_since < REBALANCE_MIN_DAYS)
-    if rebs:
-        st.caption(f"Last rebalance: **{last_date}** "
-                   f"({days_since} days ago)." if days_since is not None
-                   else f"Last rebalance: **{last_date}**.")
 
+    if last_date:
+        st.caption(f"Last rebalance: **{last_date}**"
+                   + (f" ({days_since} days ago)." if days_since is not None else "."))
+
+    btn_label = "Rebalance Both" if any_started else "Start Both Portfolios"
     if st.button(btn_label, type="primary"):
         if too_soon:
             st.warning(f"Too soon — last rebalance was {days_since} days ago "
                        f"(monthly cadence expects ≥ {REBALANCE_MIN_DAYS} days). "
                        f"Wait {REBALANCE_MIN_DAYS - days_since} more day(s). "
-                       f"Portfolio unchanged.")
+                       f"Both portfolios unchanged.")
         else:
-            with st.spinner(f"Scoring the universe and selecting top "
-                            f"{PORTFOLIO_BASKET_N}..."):
+            with st.spinner("Scoring the universe once and selecting both baskets..."):
                 rw = reg["weights"]
                 scored = scan_universe(rw["momentum"], rw["quality"],
                                        rw["value"], rw["trend"])
-                selected = select_top(scored, PORTFOLIO_BASKET_N,
-                                      diversify, sector_cap)
                 today_str = datetime.now().strftime("%Y-%m-%d")
-                save_rebalance(today_str, selected, reg["regime"])
-            st.success(f"Rebalanced {today_str}: {len(selected)} equal-weight "
-                       f"holdings saved. Equity curve updated below.")
-            rebs = parse_rebalances()  # refresh after write
+                counts = {}
+                for t, cfg in TRACKS.items():
+                    sel = select_top(scored, PORTFOLIO_BASKET_N,
+                                     cfg["diversify"], cfg["cap"])
+                    save_rebalance(t, today_str, sel, reg["regime"])
+                    counts[t] = len(sel)
+            st.success(f"Rebalanced both tracks on {today_str}: "
+                       + " · ".join(f"{TRACKS[t]['label']} {n}"
+                                    for t, n in counts.items())
+                       + " equal-weight holdings. Curves updated below.")
+            track_rebs = {t: parse_rebalances(t) for t in TRACKS}
+            any_started = True
+            last_date = today_str
 
     # --- Empty state ---
-    if not rebs:
-        st.info("No rebalances yet. Click **Start Portfolio** to begin tracking "
-                "the strategy as one basket against SPY.")
+    if not any_started:
+        st.info("No rebalances yet. Click **Start Both Portfolios** to begin the "
+                "head-to-head — both baskets stamp the same inception.")
     else:
-        last_date = rebs[-1]["date"]  # refresh in case we just rebalanced
         prices_all = load_prices()
-        strat = build_strategy_curve(rebs, prices_all)
-        if strat is None or len(strat) < 2:
-            st.warning("Not enough price history yet to build the equity curve — "
+        curves = {}
+        for t in TRACKS:
+            if track_rebs[t]:
+                c = build_strategy_curve(track_rebs[t], prices_all)
+                if c is not None:
+                    curves[t] = c
+
+        if not curves or all(len(c) < 2 for c in curves.values()):
+            st.warning("Not enough price history yet to build the equity curves — "
                        "check back after the next trading day.")
         else:
-            spy = build_spy_curve(strat.index)
+            # Shared timeline: union of every track's dates, SPY rebased on it.
+            combined = None
+            for c in curves.values():
+                combined = c.index if combined is None else combined.union(c.index)
+            combined = combined.sort_values()
+            spy = build_spy_curve(combined)
 
-            # --- Equity curve ---
-            st.markdown("#### Equity Curve — Strategy vs SPY (from inception)")
-            chart = pd.DataFrame({"Strategy": strat})
+            # --- Equity curves: both tracks + SPY on one chart ---
+            st.markdown("#### Equity Curves — from inception")
+            chart = pd.DataFrame(index=combined)
+            for t, c in curves.items():
+                chart[TRACKS[t]["label"]] = c.reindex(combined)
             if spy is not None:
-                chart["SPY"] = spy
+                chart["SPY"] = spy.reindex(combined)
             st.line_chart(chart)
-            cur_val = float(strat.iloc[-1])
-            e1, e2, e3 = st.columns(3)
-            e1.metric("Portfolio value", f"${cur_val:,.0f}",
-                      f"{cur_val / START_CAPITAL - 1:+.1%}")
-            if spy is not None and len(spy) > 1:
-                spy_val = float(spy.iloc[-1])
-                e2.metric("SPY (same $ start)", f"${spy_val:,.0f}",
-                          f"{spy_val / START_CAPITAL - 1:+.1%}")
-                e3.metric("Strategy vs SPY",
-                          f"{(cur_val - spy_val) / START_CAPITAL:+.1%}",
-                          help="Difference in total return since inception.")
 
-            # --- Metrics table ---
+            tiles = st.columns(len(curves) + (1 if spy is not None else 0))
+            i = 0
+            for t, c in curves.items():
+                v = float(c.iloc[-1])
+                tiles[i].metric(TRACKS[t]["label"], f"${v:,.0f}",
+                                f"{v / START_CAPITAL - 1:+.1%}")
+                i += 1
+            if spy is not None:
+                sv = float(spy.dropna().iloc[-1])
+                tiles[i].metric("SPY", f"${sv:,.0f}",
+                                f"{sv / START_CAPITAL - 1:+.1%}")
+
+            # --- Metrics table: all three ---
             st.markdown("#### Performance Metrics")
-            st.caption(f"Inception {strat.index[0].date()} → {strat.index[-1].date()}. "
+            st.caption(f"Inception {combined[0].date()} → {combined[-1].date()}. "
                        f"Annualized by calendar time; volatility from daily returns. "
                        f"Short track records are noisy — read with care.")
-            st.table(metrics_table([("Strategy", portfolio_metrics(strat)),
-                                    ("SPY", portfolio_metrics(spy))]))
+            pairs = [(TRACKS[t]["label"], portfolio_metrics(curves[t]))
+                     for t in curves]
+            if spy is not None:
+                pairs.append(("SPY", portfolio_metrics(spy)))
+            st.table(metrics_table(pairs))
 
-            # --- Current holdings (per-name P&L since last rebalance) ---
-            st.markdown(f"#### Current Holdings — since last rebalance ({last_date})")
-            last = rebs[-1]
-            hrows = []
-            for tk, entry, wt in zip(last["tickers"], last["entry_prices"],
-                                     last["weights"]):
-                cur = None
-                if tk in prices_all.columns:
-                    s = prices_all[tk].dropna()
-                    if len(s) > 0:
-                        cur = float(s.iloc[-1])
-                pnl = ((cur / entry) - 1) if (cur is not None and entry) else None
-                hrows.append({
-                    "Ticker": tk,
-                    "Entry": f"${entry:.2f}" if entry else "—",
-                    "Current": f"${cur:.2f}" if cur is not None else "—",
-                    "P&L": f"{pnl:+.1%}" if pnl is not None else "—",
-                    "Weight": f"{wt:.1%}" if wt is not None else "—",
-                })
-            st.dataframe(pd.DataFrame(hrows), use_container_width=True,
-                         hide_index=True)
+            # --- Per-track holdings + history ---
+            for t in TRACKS:
+                if track_rebs[t]:
+                    with st.expander(f"{TRACKS[t]['label']} — holdings & history"):
+                        render_track_detail(track_rebs[t], prices_all)
 
-        # --- Rebalance history (always shown once started) ---
-        st.markdown("#### Rebalance History")
-        hist = []
-        for r in reversed(rebs):
-            tickers = r["tickers"]
-            preview = ", ".join(tickers[:8]) + (" …" if len(tickers) > 8 else "")
-            hist.append({"Date": r["date"], "Regime": r["regime"],
-                         "Holdings": len(tickers), "Tickers": preview})
-        st.dataframe(pd.DataFrame(hist), use_container_width=True, hide_index=True)
 
 with tab_search:
     q = st.text_input("Enter any US ticker(s), comma-separated",
