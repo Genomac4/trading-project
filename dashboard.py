@@ -290,6 +290,24 @@ def prior_snapshot(before_date):
     return d, pd.read_csv(f"{SCAN_HISTORY_DIR}/{d}.csv")
 
 
+def latest_snapshot_date():
+    """Date string of the most recent saved scan snapshot, or None if none."""
+    if not os.path.isdir(SCAN_HISTORY_DIR):
+        return None
+    dates = sorted(f[:-4] for f in os.listdir(SCAN_HISTORY_DIR)
+                   if f.endswith(".csv"))
+    return dates[-1] if dates else None
+
+
+def days_since(date_str):
+    """Whole days from date_str (YYYY-MM-DD) to today, or None if unparseable."""
+    try:
+        return (datetime.now().date()
+                - datetime.strptime(date_str, "%Y-%m-%d").date()).days
+    except (ValueError, TypeError):
+        return None
+
+
 def compute_flags(scored, prior_df, prior_date, top_n=20, diversify=False, cap=2):
     """Diff today's ranked scan against the prior snapshot.
 
@@ -640,7 +658,9 @@ PAPER_DIR = "data/paper_portfolio"
 REBAL_COLS = ["date", "regime", "tickers", "entry_prices", "weights"]
 PORTFOLIO_BASKET_N = 30
 START_CAPITAL = 10_000.0
-REBALANCE_MIN_DAYS = 25  # monthly cadence guard
+REBALANCE_MIN_DAYS = 25  # monthly cadence guard (block re-rebalancing sooner)
+REBALANCE_DUE_DAYS = 28  # status banner: flag as due for the monthly rebalance
+SCAN_STALE_DAYS = 7      # flags banner: suggest a fresh scan past this age
 
 # Two tracks run head-to-head from the same inception: same universe scan, same
 # regime weights, different post-ranking selection filter. Each has its own file.
@@ -906,6 +926,18 @@ with tab_flags:
                "current regime weights, saves a dated snapshot, and diffs it "
                "against the most recent prior snapshot to surface opportunities.")
 
+    # --- Last-scan indicator ---
+    _snap_date = latest_snapshot_date()
+    _snap_age = days_since(_snap_date) if _snap_date else None
+    if _snap_date is None:
+        st.info("No scan snapshots saved yet — run a scan to start the history.")
+    elif _snap_age is not None and _snap_age > SCAN_STALE_DAYS:
+        st.warning(f"Consider running a scan — last snapshot {_snap_date} "
+                   f"({_snap_age} days ago).")
+    else:
+        st.caption(f"Last scanned {_snap_age} day(s) ago "
+                   f"(snapshot {_snap_date}).")
+
     if st.button("Run flag scan (refreshes prices — ~5 min)", type="primary"):
         today_str = datetime.now().strftime("%Y-%m-%d")
         status = st.status("Refreshing S&P 500 prices before scanning...")
@@ -1005,25 +1037,30 @@ with tab_portfolio:
     # across either file.
     all_last = [r[-1]["date"] for r in track_rebs.values() if r]
     last_date = max(all_last) if all_last else None
-    days_since = None
-    if last_date:
-        try:
-            days_since = (datetime.now().date()
-                          - datetime.strptime(last_date, "%Y-%m-%d").date()).days
-        except Exception:
-            days_since = None
-    too_soon = (days_since is not None and days_since < REBALANCE_MIN_DAYS)
+    dsince = days_since(last_date) if last_date else None
+    too_soon = (dsince is not None and dsince < REBALANCE_MIN_DAYS)
 
-    if last_date:
-        st.caption(f"Last rebalance: **{last_date}**"
-                   + (f" ({days_since} days ago)." if days_since is not None else "."))
+    # --- Status banner ---
+    b1, b2, b3 = st.columns(3)
+    b1.metric("Last rebalance", last_date if last_date else "—")
+    b2.metric("Days since", str(dsince) if dsince is not None else "—")
+    if last_date is None:
+        b3.metric("Status", "No rebalance yet")
+    elif dsince is not None and dsince >= REBALANCE_DUE_DAYS:
+        b3.metric("Status", "Due for rebalance",
+                  f"{dsince}d since last", delta_color="inverse")
+    else:
+        rem = REBALANCE_DUE_DAYS - dsince if dsince is not None else None
+        b3.metric("Status", "Not yet due",
+                  f"{rem} day(s) to go" if rem is not None else None,
+                  delta_color="off")
 
     btn_label = "Rebalance Both" if any_started else "Start Both Portfolios"
     if st.button(btn_label, type="primary"):
         if too_soon:
-            st.warning(f"Too soon — last rebalance was {days_since} days ago "
+            st.warning(f"Too soon — last rebalance was {dsince} days ago "
                        f"(monthly cadence expects ≥ {REBALANCE_MIN_DAYS} days). "
-                       f"Wait {REBALANCE_MIN_DAYS - days_since} more day(s). "
+                       f"Wait {REBALANCE_MIN_DAYS - dsince} more day(s). "
                        f"Both portfolios unchanged.")
         else:
             with st.spinner("Scoring the universe once and selecting both baskets..."):
