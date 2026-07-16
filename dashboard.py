@@ -1004,12 +1004,26 @@ def render_track_detail(rebs, prices_all):
         pnl = ((cur / entry) - 1) if (cur is not None and entry) else None
         hrows.append({
             "Ticker": tk,
-            "Entry": f"${entry:.2f}" if entry else "—",
-            "Current": f"${cur:.2f}" if cur is not None else "—",
-            "P&L": f"{pnl:+.1%}" if pnl is not None else "—",
-            "Weight": f"{wt:.1%}" if wt is not None else "—",
+            "Entry": entry if entry else None,
+            "Current": cur,
+            # percentage points, not fractions: NumberColumn's printf format
+            # renders the % sign, so the stored value must already be scaled.
+            "P&L": pnl * 100 if pnl is not None else None,
+            "Weight": wt * 100 if wt is not None else None,
         })
-    st.dataframe(pd.DataFrame(hrows), use_container_width=True, hide_index=True)
+    # Keep these columns numeric rather than preformatted strings: a string P&L
+    # sorts lexicographically, which ranks "-3.8%" above "-2.5%" and pushes every
+    # gain ("+…") below every loss ("-…"). Sorted best -> worst, unpriced last.
+    hdf = pd.DataFrame(hrows).sort_values("P&L", ascending=False, na_position="last")
+    st.dataframe(
+        hdf, use_container_width=True, hide_index=True,
+        column_config={
+            "Entry": st.column_config.NumberColumn("Entry", format="$%.2f"),
+            "Current": st.column_config.NumberColumn("Current", format="$%.2f"),
+            "P&L": st.column_config.NumberColumn("P&L", format="%+.1f%%"),
+            "Weight": st.column_config.NumberColumn("Weight", format="%.1f%%"),
+        },
+    )
 
     st.markdown("**Rebalance history**")
     hist = []
@@ -1087,6 +1101,15 @@ with tab_portfolio:
         st.info("No rebalances yet. Click **Start Both Portfolios** to begin the "
                 "head-to-head — both baskets stamp the same inception.")
     else:
+        # A track with no ledger silently drops out of the chart, tiles and
+        # metrics below — say so, rather than leaving a one-sided head-to-head
+        # that looks like a rendering bug.
+        no_ledger = [TRACKS[t]["label"] for t in TRACKS if not track_rebs[t]]
+        if no_ledger:
+            st.warning(f"No rebalance ledger yet for: {', '.join(no_ledger)} — "
+                       f"that track is missing from everything below. Click "
+                       f"**Rebalance Both** to bring it in line.")
+
         prices_all = load_prices()
         curves = {}
         for t in TRACKS:
