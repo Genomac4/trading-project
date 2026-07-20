@@ -1,5 +1,7 @@
 import pandas as pd
-from point_in_time import _fetch_raw, _build_availability_map
+from point_in_time import (
+    _fetch_raw, _build_availability_map, _quarter_availability,
+)
 
 
 def pit_two_years(ticker, as_of_date):
@@ -70,12 +72,13 @@ def pit_two_years(ticker, as_of_date):
     return extract(curr_end), extract(prev_end)
 
 
-def pit_fscore(ticker, as_of_date):
-    """Piotroski F-score from point-in-time data. Returns 0-9 or None."""
-    curr, prev = pit_two_years(ticker, as_of_date)
-    if curr is None or prev is None:
-        return None
-
+def _score_pair(curr, prev):
+    """The 9 Piotroski signals over a (current, prior) pair of period dicts.
+    Returns (signals_scored, signals_available). Shared by the annual and
+    quarterly F-scores so both use the exact same signal logic. Each dict must
+    expose the keys produced by pit_two_years / pit_two_quarters. Missing
+    inputs (JPM-style gaps) simply make a signal unavailable rather than crash.
+    """
     signals = 0
     available = 0
 
@@ -125,6 +128,97 @@ def pit_fscore(ticker, as_of_date):
         available += 1
         signals += 1 if (curr["Revenue"] / curr["TotalAssets"]) > (prev["Revenue"] / prev["TotalAssets"]) else 0
 
+    return signals, available
+
+
+def pit_fscore(ticker, as_of_date):
+    """Piotroski F-score from point-in-time ANNUAL data. Returns 0-9 or None."""
+    curr, prev = pit_two_years(ticker, as_of_date)
+    if curr is None or prev is None:
+        return None
+    signals, available = _score_pair(curr, prev)
+    if available < 5:
+        return None
+    return signals
+
+
+def pit_two_quarters(ticker, as_of_date):
+    """
+    Quarterly analog of pit_two_years: return (current_quarter, prior_quarter)
+    fundamentals dicts as known on as_of_date — the most recent AVAILABLE
+    quarter and the one immediately before it. Availability uses each quarter's
+    own embedded filing_date (fallback: quarter_end + QUARTERLY_LAG_DAYS). Both
+    quarters must have been filed by as_of_date. Returns (None, None) if fewer
+    than two quarters are available.
+
+    NOTE: this compares consecutive quarters (Q vs the prior quarter), the
+    direct analog of the annual Q-vs-prior-year path. That carries seasonality
+    for the flow-based signals; a year-over-year variant is a possible refinement
+    but is intentionally out of scope for this additive engine.
+    """
+    as_of = pd.Timestamp(as_of_date)
+    data = _fetch_raw(ticker)
+    if data is None:
+        return None, None
+
+    fin = data.get("Financials", {})
+    income = fin.get("Income_Statement", {}).get("quarterly", {})
+    balance = fin.get("Balance_Sheet", {}).get("quarterly", {})
+    cashflow = fin.get("Cash_Flow", {}).get("quarterly", {})
+    if not income:
+        return None, None
+
+    available_quarters = []
+    for date_str, inc_row in income.items():
+        q_end = pd.to_datetime(date_str)
+        avail = _quarter_availability(date_str, inc_row,
+                                      balance.get(date_str), cashflow.get(date_str))
+        if avail <= as_of:
+            available_quarters.append(q_end)
+
+    if len(available_quarters) < 2:
+        return None, None
+
+    available_quarters.sort()
+    curr_end = available_quarters[-1]
+    prev_end = available_quarters[-2]
+
+    def extract(q_end):
+        key = q_end.strftime("%Y-%m-%d")
+        inc = income.get(key, {}) or {}
+        bal = balance.get(key, {}) or {}
+        cf = cashflow.get(key, {}) or {}
+
+        def f(v):
+            try:
+                return float(v) if v is not None else None
+            except (ValueError, TypeError):
+                return None
+
+        return {
+            "Revenue": f(inc.get("totalRevenue")),
+            "NetIncome": f(inc.get("netIncome")),
+            "GrossProfit": f(inc.get("grossProfit")),
+            "CostOfRevenue": f(inc.get("costOfRevenue")),
+            "TotalAssets": f(bal.get("totalAssets")),
+            "CurrentAssets": f(bal.get("totalCurrentAssets")),
+            "CurrentLiabilities": f(bal.get("totalCurrentLiabilities")),
+            "LongTermDebt": f(bal.get("longTermDebt")),
+            "SharesOutstanding": f(bal.get("commonStockSharesOutstanding")),
+            "OperatingCashFlow": f(cf.get("totalCashFromOperatingActivities")),
+        }
+
+    return extract(curr_end), extract(prev_end)
+
+
+def pit_fscore_quarterly(ticker, as_of_date):
+    """Piotroski F-score from point-in-time QUARTERLY data. Returns 0-9 or None.
+    Same 9 signals and same '>=5 of 9 available' rule as the annual F-score,
+    reusing _score_pair — just fed consecutive quarters instead of years."""
+    curr, prev = pit_two_quarters(ticker, as_of_date)
+    if curr is None or prev is None:
+        return None
+    signals, available = _score_pair(curr, prev)
     if available < 5:
         return None
     return signals

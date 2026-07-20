@@ -7,6 +7,9 @@ import json
 
 # Conservative fallback lag if a real reportDate is missing
 ANNUAL_LAG_DAYS = 90
+# Conservative fallback lag if a quarterly row's filing_date is missing
+# (10-Q filing deadline is ~40-45 days after quarter end for large filers)
+QUARTERLY_LAG_DAYS = 45
 
 
 _RAW_MEM = {}
@@ -141,6 +144,94 @@ def point_in_time_fundamentals(ticker, as_of_date, _cache={}):
     return {
         "ticker": ticker,
         "fiscal_year_end": key,
+        "available_since": avail.strftime("%Y-%m-%d"),
+        "Revenue": f(inc.get("totalRevenue")),
+        "NetIncome": f(inc.get("netIncome")),
+        "GrossProfit": f(inc.get("grossProfit")),
+        "EBITDA": f(inc.get("ebitda")),
+        "TotalAssets": f(bal.get("totalAssets")),
+        "TotalLiabilities": f(bal.get("totalLiab")),
+        "CurrentAssets": f(bal.get("totalCurrentAssets")),
+        "CurrentLiabilities": f(bal.get("totalCurrentLiabilities")),
+        "LongTermDebt": f(bal.get("longTermDebt")),
+        "SharesOutstanding": f(bal.get("commonStockSharesOutstanding")),
+        "OperatingCashFlow": f(cf.get("totalCashFromOperatingActivities")),
+        "FreeCashFlow": f(cf.get("freeCashFlow")),
+    }
+
+
+def _quarter_availability(period_end, *rows):
+    """When did a quarter become public? Use the embedded filing_date from the
+    first statement row that carries one (the real 10-Q/10-K date); if none is
+    present, fall back to period_end + QUARTERLY_LAG_DAYS. Returns a Timestamp."""
+    for row in rows:
+        fd = row.get("filing_date") if isinstance(row, dict) else None
+        if fd:
+            try:
+                return pd.to_datetime(fd)
+            except (ValueError, TypeError):
+                pass
+    return pd.to_datetime(period_end) + timedelta(days=QUARTERLY_LAG_DAYS)
+
+
+def point_in_time_fundamentals_quarterly(ticker, as_of_date, _cache={}):
+    """
+    Return the most recent QUARTERLY fundamentals that were actually FILED on
+    or before as_of_date. Never returns data filed later than as_of_date.
+
+    This is the quarterly analog of point_in_time_fundamentals. Availability
+    comes from each quarter's OWN filing_date field (the actual 10-Q/10-K date
+    embedded on every Financials::*::quarterly row — confirmed by the inventory
+    on 100% of AAPL/JPM quarters), so no join against Earnings::History is
+    needed. Falls back to period_end + 45 days only if a filing_date is missing.
+
+    The existing annual functions are unchanged; this is purely additive.
+    """
+    as_of = pd.Timestamp(as_of_date)
+
+    # Cache the raw payload per ticker (avoid re-pulling every month)
+    if ticker not in _cache:
+        _cache[ticker] = _fetch_raw(ticker)
+    data = _cache[ticker]
+    if data is None:
+        return None
+
+    fin = data.get("Financials", {})
+    income = fin.get("Income_Statement", {}).get("quarterly", {})
+    balance = fin.get("Balance_Sheet", {}).get("quarterly", {})
+    cashflow = fin.get("Cash_Flow", {}).get("quarterly", {})
+    if not income:
+        return None
+
+    # Each quarter becomes available on its own filing_date.
+    candidates = []
+    for date_str, inc_row in income.items():
+        q_end = pd.to_datetime(date_str)
+        avail = _quarter_availability(date_str, inc_row,
+                                      balance.get(date_str), cashflow.get(date_str))
+        if avail <= as_of:                      # refuse anything filed later
+            candidates.append((q_end, avail))
+
+    if not candidates:
+        return None  # nothing filed yet -> ineligible (same as annual rule 4)
+
+    # Most recent AVAILABLE quarter
+    q_end, avail = max(candidates, key=lambda x: x[0])
+    key = q_end.strftime("%Y-%m-%d")
+
+    inc = income.get(key, {}) or {}
+    bal = balance.get(key, {}) or {}
+    cf = cashflow.get(key, {}) or {}
+
+    def f(v):
+        try:
+            return float(v) if v is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "ticker": ticker,
+        "fiscal_quarter_end": key,
         "available_since": avail.strftime("%Y-%m-%d"),
         "Revenue": f(inc.get("totalRevenue")),
         "NetIncome": f(inc.get("netIncome")),
