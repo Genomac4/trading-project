@@ -221,6 +221,155 @@ def get_valuation(ticker, max_age_hours=FUNDAMENTALS_MAX_AGE_HOURS):
     print(f"[{ticker}] Pulled and saved valuation")
     return result
 
+# ---- Bulk end-of-day prices (batch refresh) ----
+UNIVERSE_PRICE_DIR = "data/universe_prices"
+BULK_EOD_URL = "https://eodhd.com/api/eod-bulk-last-day/US"
+MIN_HISTORY_ROWS = 260      # factors need ~252 contiguous trading days
+MAX_BACKFILL_DAYS = 14      # walk back at most 2 weeks before a full refetch
+
+
+def bulk_last_day_prices(date=None, symbols=None, timeout=120):
+    """One HTTP call for the whole US market's most recent close (or a given
+    `date`). Returns {ticker: {"date": 'YYYY-MM-DD', "close": float}}.
+
+    This is EODHD's eod-bulk-last-day endpoint: ~50k tickers in a single
+    request (~4s) instead of one call per ticker. `symbols` can restrict the
+    result but isn't needed for a universe-wide refresh. Uses adjusted_close to
+    stay consistent with the cached history."""
+    params = {"api_token": EODHD_API_KEY, "fmt": "json"}
+    if date:
+        params["date"] = date
+    if symbols:
+        params["symbols"] = ",".join(symbols)
+    try:
+        resp = requests.get(BULK_EOD_URL, params=params, timeout=timeout)
+        if resp.status_code != 200:
+            return {}
+        rows = resp.json()
+    except Exception:
+        return {}
+
+    out = {}
+    for row in rows or []:
+        code = row.get("code")
+        d = row.get("date")
+        ac = row.get("adjusted_close")
+        if ac is None:
+            ac = row.get("close")
+        if code and d and ac is not None:
+            try:
+                out[code] = {"date": d, "close": float(ac)}
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _cached_last_date(path):
+    """(last_date_str, n_rows) for a cached price CSV, reading only the date
+    column. Assumes the file is sorted ascending (as build_universe writes it).
+    Returns (None, 0) if missing/empty/unreadable."""
+    if not os.path.exists(path):
+        return None, 0
+    try:
+        col = pd.read_csv(path, usecols=[0], header=0)
+        if len(col) == 0:
+            return None, 0
+        return str(col.iloc[-1, 0])[:10], len(col)
+    except Exception:
+        return None, 0
+
+
+def refresh_universe_prices(tickers, price_dir=UNIVERSE_PRICE_DIR, progress=None,
+                            per_ticker_fetch=None, max_backfill_days=MAX_BACKFILL_DAYS):
+    """Top up cached daily price CSVs to the latest close using the bulk
+    endpoint instead of one call per ticker.
+
+    Strategy:
+      - one whole-market snapshot for the latest close, plus one snapshot per
+        missing trading day so each series stays contiguous;
+      - append only the bars newer than each ticker's last cached date;
+      - tickers that are uncached, too short, absent from the feed, or staler
+        than max_backfill_days fall back to `per_ticker_fetch` (full-history
+        refetch) when one is supplied.
+
+    Does not touch fundamentals or factor logic. Returns a counts dict:
+    {updated, fell_back, up_to_date, no_data}."""
+    os.makedirs(price_dir, exist_ok=True)
+    tickers = list(dict.fromkeys(tickers))      # de-dup, preserve order
+
+    latest = bulk_last_day_prices()
+    if not latest:
+        return {"updated": 0, "fell_back": 0, "up_to_date": 0,
+                "no_data": len(tickers)}
+    latest_date = max(bar["date"] for bar in latest.values())
+
+    stale = {}          # ticker -> last cached date (str), needs a few new bars
+    fallbacks = []      # ticker -> needs full-history refetch
+    up_to_date = 0
+    no_data = 0
+
+    for t in tickers:
+        path = f"{price_dir}/{t}.csv"
+        last_date, n = _cached_last_date(path)
+        if last_date is None or n < MIN_HISTORY_ROWS:
+            fallbacks.append(t)                 # no/short cache -> full history
+            continue
+        if last_date >= latest_date:
+            up_to_date += 1                     # already current
+            continue
+        if t not in latest:
+            no_data += 1                        # cached but delisted / absent
+            continue
+        if (pd.Timestamp(latest_date) - pd.Timestamp(last_date)).days > max_backfill_days:
+            fallbacks.append(t)                 # too stale for day-by-day fill
+            continue
+        stale[t] = last_date
+
+    # Collect the daily snapshots needed to fill gaps contiguously.
+    snapshots = {latest_date: latest}
+    if stale:
+        floor = pd.Timestamp(min(stale.values()))
+        day = pd.Timestamp(latest_date) - pd.Timedelta(days=1)
+        while day > floor:
+            snap = bulk_last_day_prices(date=day.strftime("%Y-%m-%d"))
+            if snap:                            # empty on weekends/holidays
+                real_date = max(bar["date"] for bar in snap.values())
+                snapshots[real_date] = snap
+            day -= pd.Timedelta(days=1)
+
+    # Append missing bars per stale ticker.
+    updated = 0
+    ordered_dates = sorted(snapshots.keys())
+    total = len(stale)
+    for i, (t, last_date) in enumerate(stale.items(), 1):
+        new_rows = [(d, snapshots[d][t]["close"])
+                    for d in ordered_dates
+                    if d > last_date and t in snapshots[d]]
+        if new_rows:
+            path = f"{price_dir}/{t}.csv"
+            try:
+                # new_rows are strictly newer than the cached last date and in
+                # ascending order, and the file is a sorted date,Close CSV, so
+                # we can append raw lines instead of rewriting the whole file.
+                with open(path, "a", newline="") as fh:
+                    fh.write("".join(f"{d},{c}\n" for d, c in new_rows))
+                updated += 1
+            except Exception:
+                fallbacks.append(t)
+        if progress:
+            progress(i, total)
+
+    # Full-history fallback for everything the bulk path couldn't top up.
+    fell_back = 0
+    if per_ticker_fetch:
+        for t in fallbacks:
+            if per_ticker_fetch(t) is not None:
+                fell_back += 1
+
+    return {"updated": updated, "fell_back": fell_back,
+            "up_to_date": up_to_date, "no_data": no_data}
+
+
 # ---- Sector (cached per ticker) ----
 SECTOR_CACHE = "data/sectors.csv"
 # In-memory mirror of the CSV so a full-universe scan doesn't re-read the file

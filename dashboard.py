@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime
 from config import EODHD_API_KEY
-from data_layer import get_valuation, get_sector
+from data_layer import get_valuation, get_sector, refresh_universe_prices
 from explore_constituents import get_sp500_membership
 from backtest_composite import cached_fscore, cached_value, zscore
 from pit_factors import pit_fscore, pit_value_inputs
@@ -81,16 +81,22 @@ def live_prices(ticker):
 
 
 def refresh_prices(tickers, status):
-    """Re-pull latest prices for a list of tickers from EODHD."""
-    done = 0
-    for i, t in enumerate(tickers, 1):
-        s = live_prices(t)
-        if s is not None:
-            done += 1
-        if i % 25 == 0:
-            status.write(f"Refreshed {i}/{len(tickers)}...")
+    """Batch-refresh a list of tickers via EODHD's bulk last-day endpoint
+    (one call for the whole market, plus one per missing trading day) instead
+    of one call per ticker. live_prices is the per-ticker full-history fallback
+    for anything uncached, too short, or very stale."""
+    def progress(done, total):
+        if total and (done % 25 == 0 or done == total):
+            status.write(f"Backfilling stale tickers {done}/{total}...")
+
+    counts = refresh_universe_prices(
+        list(tickers), price_dir=PRICE_DIR, progress=progress,
+        per_ticker_fetch=live_prices)
     load_prices.clear()
-    return done
+    status.write(
+        f"updated={counts['updated']}  fallback={counts['fell_back']}  "
+        f"already-current={counts['up_to_date']}  no-data={counts['no_data']}")
+    return counts["updated"] + counts["fell_back"]
 
 
 def get_price_series(ticker, prices_all):
