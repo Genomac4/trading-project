@@ -2,11 +2,12 @@ import os
 import numpy as np
 import pandas as pd
 from explore_constituents import get_sp500_membership, members_on_date
-from pit_factors import pit_fscore, pit_value_inputs
+from pit_factors import pit_fscore, pit_value_inputs, pit_fscore_quarterly_yoy
 
 PRICE_DIR = "data/universe_prices"
 
 _fscore_cache = {}
+_fscore_q_cache = {}
 _value_cache = {}
 
 
@@ -18,6 +19,19 @@ def cached_fscore(ticker, year):
         except Exception:
             _fscore_cache[key] = None
     return _fscore_cache[key]
+
+
+def cached_fscore_quarterly(ticker, year):
+    """Quarterly-YoY quality analog of cached_fscore. Same as-of (June 30 of the
+    rebalance year) and same (ticker, year) cache key, so the only difference vs
+    cached_fscore is the annual F-score -> quarterly-YoY F-score input."""
+    key = (ticker, year)
+    if key not in _fscore_q_cache:
+        try:
+            _fscore_q_cache[key] = pit_fscore_quarterly_yoy(ticker, f"{year}-06-30")
+        except Exception:
+            _fscore_q_cache[key] = None
+    return _fscore_q_cache[key]
 
 
 def cached_value(ticker, year):
@@ -49,6 +63,7 @@ def precompute(prices, year_start=2005, year_end=2027):
     for n, ticker in enumerate(tickers, 1):
         for year in years:
             cached_fscore(ticker, year)
+            cached_fscore_quarterly(ticker, year)
             cached_value(ticker, year)
         if n % 100 == 0:
             print(f"  {n}/{len(tickers)} done")
@@ -77,7 +92,8 @@ def zscore(series):
 
 def run_backtest(prices, membership, trend_table, top_n=30, cost_per_trade=0.0005,
                  start="2017-01-01", end="2026-06-30",
-                 w_mom=1.0, w_qual=0.0, w_val=0.0, w_trend=0.0, label=""):
+                 w_mom=1.0, w_qual=0.0, w_val=0.0, w_trend=0.0, label="",
+                 fscore_fn=cached_fscore):
     all_daily = {t: prices[t] for t in prices.columns}
     monthly = prices.resample("ME").last().loc[start:end]
     trend_m = trend_table.loc[start:end]
@@ -103,7 +119,7 @@ def run_backtest(prices, membership, trend_table, top_n=30, cost_per_trade=0.000
             if pd.isna(p_12mo) or pd.isna(p_1mo) or pd.isna(p_now) or p_12mo <= 0 or p_now <= 0:
                 continue
             mom = (p_1mo / p_12mo) - 1
-            fs = cached_fscore(ticker, year)
+            fs = fscore_fn(ticker, year)
             vi = cached_value(ticker, year)
             ey = None
             if vi is not None:
@@ -203,11 +219,16 @@ PERIODS = [
     ("2019-2026 (covid+AI bull)",   "2019-01-01", "2026-06-30"),
 ]
 
+# Each config carries which F-score feeds the quality weight. All existing
+# configs use the annual F-score (cached_fscore) exactly as before; the added
+# "MOM+QUALITY (quarterly)" is identical to "MOM+QUALITY" except it uses the
+# quarterly-YoY F-score, so the two are a clean head-to-head on quality input.
 CONFIGS = [
-    ("MOMENTUM",         1.0,  0.0,  0.0,  0.0),
-    ("MOM+QUALITY",      0.5,  0.5,  0.0,  0.0),
-    ("MOM+QUAL+TREND",   0.4,  0.4,  0.0,  0.2),
-    ("FULL (all four)",  0.3,  0.3,  0.2,  0.2),
+    ("MOMENTUM",                1.0,  0.0,  0.0,  0.0, cached_fscore),
+    ("MOM+QUALITY",             0.5,  0.5,  0.0,  0.0, cached_fscore),
+    ("MOM+QUALITY (quarterly)", 0.5,  0.5,  0.0,  0.0, cached_fscore_quarterly),
+    ("MOM+QUAL+TREND",          0.4,  0.4,  0.0,  0.2, cached_fscore),
+    ("FULL (all four)",         0.3,  0.3,  0.2,  0.2, cached_fscore),
 ]
 
 if __name__ == "__main__":
@@ -223,11 +244,11 @@ if __name__ == "__main__":
         print(f"\n{'#'*70}\nPERIOD: {pname}\n{'#'*70}")
         rows = []
         idx = None
-        for label, wm, wq, wv, wt in CONFIGS:
+        for label, wm, wq, wv, wt, fscore_fn in CONFIGS:
             res = run_backtest(prices, membership, trend_table,
                                start=start, end=end,
                                w_mom=wm, w_qual=wq, w_val=wv, w_trend=wt,
-                               label=label)
+                               label=label, fscore_fn=fscore_fn)
             if len(res) == 0:
                 continue
             m = metrics(res["strat_return"])
@@ -243,8 +264,8 @@ if __name__ == "__main__":
         ms["label"] = "SPY"
         rows.append(ms)
 
-        print(f"\n{'STRATEGY':<18}{'Annual':>9}{'Vol':>8}{'Sharpe':>8}{'MaxDD':>8}")
-        print("-" * 51)
+        print(f"\n{'STRATEGY':<26}{'Annual':>9}{'Vol':>8}{'Sharpe':>8}{'MaxDD':>8}")
+        print("-" * 59)
         for m in rows:
-            print(f"{m['label']:<18}{m['annual']:>8.1%}{m['vol']:>7.1%}"
+            print(f"{m['label']:<26}{m['annual']:>8.1%}{m['vol']:>7.1%}"
                   f"{m['sharpe']:>8.2f}{m['max_dd']:>8.1%}")
