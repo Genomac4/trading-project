@@ -10,6 +10,8 @@ from explore_constituents import get_sp500_membership
 from backtest_composite import cached_fscore, cached_value, zscore
 from pit_factors import pit_fscore, pit_value_inputs
 from screener import get_regime_weights
+# Read-only Schwab access (GET endpoints only — see schwab_client.py docstring).
+from schwab_client import SchwabAuthError, get_balances, get_positions
 
 PRICE_DIR = "data/universe_prices"
 SCAN_HISTORY_DIR = "data/scan_history"
@@ -906,8 +908,9 @@ sector_cap = st.sidebar.number_input("Max per sector", 1, 10, 2, disabled=not di
 if diversify:
     st.sidebar.info(f"Sector diversification ON — max {int(sector_cap)} per sector.")
 
-tab_scan, tab_flags, tab_portfolio, tab_search, tab_ideas = st.tabs(
-    ["Full S&P Scan", "Flags", "Portfolio", "Search Any Ticker", "Ideas"])
+(tab_scan, tab_flags, tab_portfolio, tab_myport, tab_search,
+ tab_ideas) = st.tabs(["Full S&P Scan", "Flags", "Portfolio", "My Portfolio",
+                       "Search Any Ticker", "Ideas"])
 
 with tab_scan:
     if st.button("Scan Full S&P 500", type="primary"):
@@ -1172,6 +1175,231 @@ with tab_portfolio:
                 if track_rebs[t]:
                     with st.expander(f"{TRACKS[t]['label']} — holdings & history"):
                         render_track_detail(track_rebs[t], prices_all)
+
+
+# ---------- My Portfolio (Schwab, read-only) ----------
+def schwab_screener_take(tkr, weights, uni_raw, prices_all):
+    """The screener's current take on one real holding: composite scored
+    against today's universe, F-score, momentum, 200d-MA position. Returns
+    None when the screener has nothing on it (non-equity, no/short history)."""
+    try:
+        r = compute_factors(tkr, prices_all)
+    except Exception:
+        return None
+    if r is None:
+        return None
+    try:
+        comp = score_against_universe(r, weights, uni_raw)
+    except Exception:
+        comp = None
+    return {"comp": comp, "fscore": r.get("fscore"),
+            "mom": r.get("momentum"), "trend": r.get("trend")}
+
+
+def _pnl_css(v):
+    """Red/green text for P&L cells — same palette as the Ideas tab."""
+    if pd.isna(v):
+        return "color: gray"
+    return ("color: #16a34a" if v > 0            # green
+            else "color: #dc2626" if v < 0       # red
+            else "color: gray")
+
+
+def _zebra_css(row):
+    """Subtle alternate-row shading; theme-safe via low-alpha gray."""
+    shade = "background-color: rgba(128,128,128,0.07)"
+    return [shade if row.name % 2 else ""] * len(row)
+
+
+with tab_myport:
+    st.subheader("My Portfolio — live Schwab holdings (read-only)")
+    st.caption("Positions and balances pulled from Schwab with GET-only calls "
+               "(no order capability exists in this integration). Each holding "
+               "is cross-referenced against the screener's CURRENT factor view "
+               "using the sidebar weights — 'I own it; what does the model "
+               "think of it today?'")
+
+    if st.button("Load / refresh from Schwab", type="primary"):
+        try:
+            with st.spinner("Fetching accounts, balances, and positions..."):
+                st.session_state["schwab"] = {
+                    "balances": get_balances(),
+                    "positions": get_positions(),
+                    "fetched": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                }
+            st.session_state.pop("schwab_err", None)
+        except SchwabAuthError as e:
+            st.session_state.pop("schwab", None)
+            st.session_state["schwab_err"] = str(e)
+        except Exception as e:
+            st.session_state.pop("schwab", None)
+            st.session_state["schwab_err"] = f"Unexpected error talking to Schwab: {e}"
+
+    if "schwab_err" in st.session_state:
+        st.error(f"**Reconnect to Schwab needed.** {st.session_state['schwab_err']}")
+        st.markdown("In a terminal (not here — the login opens a browser):")
+        st.code("python schwab_client.py login", language="bash")
+    elif "schwab" not in st.session_state:
+        st.info("Click **Load / refresh from Schwab** to pull your live "
+                "positions. First time? Connect your account from a terminal "
+                "first with `python schwab_client.py login`.")
+    else:
+        snap = st.session_state["schwab"]
+        positions = snap["positions"]
+        opt_pos = [p for p in positions if p["asset_type"] == "OPTION"]
+        eq_pos = [p for p in positions if p["asset_type"] != "OPTION"]
+
+        # --- Score stock/fund holdings against the screener ---
+        eq_rows = []
+        if eq_pos:
+            weights = (w_mom, w_qual, w_val, w_trend)
+            with st.spinner("Scoring holdings against today's universe..."):
+                uni = universe_factor_frame()
+                members = set(current_members())
+                prices_all = load_prices()
+                for p in eq_pos:
+                    tkr = p["ticker"]
+                    take = None
+                    # Only chart-able security types get a screener view; cash
+                    # sweeps, bonds etc. show as N/A.
+                    if p["asset_type"] in ("EQUITY", "COLLECTIVE_INVESTMENT",
+                                           "ETF", "INDEX"):
+                        take = schwab_screener_take(tkr, weights, uni, prices_all)
+                    trend = take.get("trend") if take else None
+                    eq_rows.append({
+                        "Ticker": tkr,
+                        "Acct": p["account"],
+                        "Qty": p["quantity"],
+                        "Mkt Value": p["market_value"],
+                        "Cost Basis": p["cost_basis"],
+                        "Unrl P&L": p["unrealized_pnl"],
+                        "Unrl P&L %": (p["unrealized_pnl_pct"] * 100
+                                       if p["unrealized_pnl_pct"] is not None else None),
+                        "Composite": take.get("comp") if take else None,
+                        "F-Score": take.get("fscore") if take else None,
+                        "Momentum %": (take["mom"] * 100
+                                       if take and pd.notna(take.get("mom")) else None),
+                        "200d MA": ("Above" if trend is not None and trend > 0
+                                    else "Below" if trend is not None else "N/A"),
+                        "In S&P 500": "Yes" if tkr in members else "No",
+                    })
+
+        # --- Summary header: totals across stocks AND options ---
+        mv_sum = sum(p["market_value"] for p in positions
+                     if p["market_value"] is not None)
+        pnl_sum = sum(p["unrealized_pnl"] for p in positions
+                      if p["unrealized_pnl"] is not None)
+        basis_sum = sum(p["cost_basis"] for p in positions
+                        if p["cost_basis"] is not None)
+        pnl_pct = (pnl_sum / abs(basis_sum)) if basis_sum else None
+        pcolor = ("green" if pnl_sum > 0 else "red" if pnl_sum < 0 else "gray")
+        pnl_str = f"${pnl_sum:+,.2f}" + (f" ({pnl_pct:+.1%})"
+                                         if pnl_pct is not None else "")
+        s1, s2, s3 = st.columns([1.4, 1.8, 0.8])
+        s1.caption("Total market value")
+        s1.markdown(f"### ${mv_sum:,.2f}")
+        s2.caption("Total unrealized P&L")
+        s2.markdown(f"### :{pcolor}[{pnl_str}]")
+        s3.caption("Positions")
+        s3.markdown(f"### {len(eq_pos)}"
+                    + (f" +{len(opt_pos)} opt" if opt_pos else ""))
+
+        # One-line portfolio-vs-screener readout.
+        scoreable = [r for r in eq_rows if r["200d MA"] in ("Above", "Below")]
+        if scoreable:
+            above = sum(1 for r in scoreable if r["200d MA"] == "Above")
+            weak = sorted(r["Ticker"] for r in eq_rows
+                          if r["Composite"] is not None and r["Composite"] < 0)
+            msg = (f"**Screener check:** {above} of {len(scoreable)} scoreable "
+                   f"holdings above their 200d MA, {len(scoreable) - above} below")
+            msg += (f" · :red[screener-weak (composite < 0): {', '.join(weak)}]"
+                    if weak else " · none score composite < 0")
+            st.markdown(msg)
+        st.caption(f"Fetched {snap['fetched']} — click the button above to refresh.")
+
+        # --- Accounts: one compact table instead of stacked metric rows ---
+        st.markdown("**Accounts**")
+        bdf = pd.DataFrame([{
+            "Account": f"...{b['account']}" + (f" ({b['type']})" if b["type"] else ""),
+            "Total value": b["total_value"],
+            "Cash": b["cash"],
+            "Buying power": b["buying_power"],
+        } for b in snap["balances"]])
+        st.dataframe(
+            bdf, use_container_width=True, hide_index=True,
+            column_config={
+                "Total value": st.column_config.NumberColumn("Total value", format="$%.2f"),
+                "Cash": st.column_config.NumberColumn("Cash", format="$%.2f"),
+                "Buying power": st.column_config.NumberColumn("Buying power", format="$%.2f"),
+            })
+
+        # --- Stock/fund holdings x screener ---
+        st.markdown("**Holdings**")
+        if not eq_rows:
+            st.info("No stock/fund positions found in the connected account(s).")
+        else:
+            hdf = (pd.DataFrame(eq_rows)
+                   .sort_values("Mkt Value", ascending=False, na_position="last")
+                   .reset_index(drop=True))
+            sty = (hdf.style
+                   .map(_pnl_css, subset=["Unrl P&L", "Unrl P&L %"])
+                   .apply(_zebra_css, axis=1))
+            st.dataframe(
+                sty, use_container_width=True, hide_index=True,
+                column_config={
+                    "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+                    "Acct": st.column_config.TextColumn("Acct", width="small"),
+                    "Qty": st.column_config.NumberColumn("Qty", format="%.2f", width="small"),
+                    "Mkt Value": st.column_config.NumberColumn("Mkt Value", format="$%.2f"),
+                    "Cost Basis": st.column_config.NumberColumn("Cost Basis", format="$%.2f"),
+                    "Unrl P&L": st.column_config.NumberColumn("Unrl P&L", format="$%.2f"),
+                    "Unrl P&L %": st.column_config.NumberColumn("Unrl P&L %", format="%+.1f%%"),
+                    "Composite": st.column_config.NumberColumn("Composite", format="%.2f"),
+                    "F-Score": st.column_config.NumberColumn("F-Score", format="%.0f", width="small"),
+                    "Momentum %": st.column_config.NumberColumn("Momentum 12-1", format="%+.1f%%"),
+                    "200d MA": st.column_config.TextColumn("200d MA", width="small"),
+                    "In S&P 500": st.column_config.TextColumn("In S&P 500", width="small"),
+                },
+            )
+            st.caption("Composite / F-Score / Momentum / 200d MA are the "
+                       "screener's current view under the sidebar weights "
+                       "(blank or N/A = not scoreable: not enough history, "
+                       "non-equity, or no fundamentals). 'In S&P 500' flags "
+                       "whether the name is inside the scan universe.")
+
+        # --- Options: separate section, never scored by the screener ---
+        if opt_pos:
+            st.markdown("**Options**")
+            odf = (pd.DataFrame([{
+                "Option": p.get("description") or p["ticker"],
+                "Underlying": p.get("underlying", ""),
+                "Acct": p["account"],
+                "Qty": p["quantity"],
+                "Mkt Value": p["market_value"],
+                "Cost Basis": p["cost_basis"],
+                "Unrl P&L": p["unrealized_pnl"],
+                "Unrl P&L %": (p["unrealized_pnl_pct"] * 100
+                               if p["unrealized_pnl_pct"] is not None else None),
+            } for p in opt_pos])
+                .sort_values("Mkt Value", ascending=False, na_position="last")
+                .reset_index(drop=True))
+            osty = (odf.style
+                    .map(_pnl_css, subset=["Unrl P&L", "Unrl P&L %"])
+                    .apply(_zebra_css, axis=1))
+            st.dataframe(
+                osty, use_container_width=True, hide_index=True,
+                column_config={
+                    "Qty": st.column_config.NumberColumn("Qty", format="%.0f", width="small"),
+                    "Mkt Value": st.column_config.NumberColumn("Mkt Value", format="$%.2f"),
+                    "Cost Basis": st.column_config.NumberColumn("Cost Basis", format="$%.2f"),
+                    "Unrl P&L": st.column_config.NumberColumn("Unrl P&L", format="$%.2f"),
+                    "Unrl P&L %": st.column_config.NumberColumn("Unrl P&L %", format="%+.1f%%"),
+                },
+            )
+            st.caption("Cost basis and P&L include the 100× contract "
+                       "multiplier (matched to Schwab's own open P&L). "
+                       "Options aren't scoreable by the screener — no "
+                       "composite/F-score/momentum columns apply.")
 
 
 with tab_search:
