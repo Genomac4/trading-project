@@ -3,7 +3,7 @@ import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import EODHD_API_KEY
 from data_layer import get_valuation, get_sector, refresh_universe_prices
 from explore_constituents import get_sp500_membership
@@ -852,6 +852,226 @@ def metrics_table(pairs):
     return pd.DataFrame(rows).set_index("")
 
 
+# ---------- Market Awareness (display-only) ----------
+# FIREWALL: everything in this section is read-only context for discretionary
+# judgment. It must never feed the screener composite, the flags diff, or the
+# paper-portfolio ledgers — no writes, no factor inputs, display only.
+
+# EODHD sector names (General.Sector, cached in data/sectors.csv) -> SPDR ETF.
+SECTOR_ETF = {
+    "Technology": "XLK", "Energy": "XLE", "Utilities": "XLU",
+    "Financial Services": "XLF", "Healthcare": "XLV", "Industrials": "XLI",
+    "Basic Materials": "XLB", "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP", "Real Estate": "XLRE",
+    "Communication Services": "XLC",
+}
+
+# The economic-events endpoint has no importance field on our plan, so "high
+# importance" is a name filter. EODHD calls CPI "Inflation Rate".
+HIGH_IMPORTANCE_EVENTS = {
+    "Fed Interest Rate Decision": "FOMC",
+    "Inflation Rate": "CPI",
+    "Non Farm Payrolls": "Nonfarm Payrolls",
+    "GDP Growth Rate": "GDP",
+    "Gross Domestic Product": "GDP",
+}
+
+# Hyperscalers / AI-capex drivers — their earnings (capex guidance) are the
+# thesis catalysts for the whole book. Hardcoded for Stage 1.
+THESIS_WATCHLIST = ["MSFT", "GOOGL", "AMZN", "META", "NVDA"]
+
+# Within this many pct-points of SPY = a market move; of the sector ETF = a
+# sector move; otherwise the move is stock-specific.
+MOVE_MATCH_PP = 1.0
+EARNINGS_SOON_DAYS = 14
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def macro_calendar():
+    """High-importance US economic events over the next 14 days as a
+    date-sorted list of (label, date). None = endpoint unavailable."""
+    start = datetime.now().date()
+    end = start + timedelta(days=14)
+    url = (f"https://eodhd.com/api/economic-events?api_token={EODHD_API_KEY}"
+           f"&country=US&from={start}&to={end}&limit=1000&fmt=json")
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            return None
+        seen, out = set(), []
+        for e in resp.json():
+            label = HIGH_IMPORTANCE_EVENTS.get(str(e.get("type", "")))
+            if not label:
+                continue
+            try:
+                d = pd.Timestamp(e["date"]).date()
+            except (ValueError, TypeError, KeyError):
+                continue
+            # mom/yoy variants and GDP aliases arrive as separate rows
+            if (label, d) in seen:
+                continue
+            seen.add((label, d))
+            out.append((label, d))
+        return sorted(out, key=lambda x: x[1])
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def treasury_10y():
+    """10-year Treasury yield level + 1-day change in bp, from US10Y.GBOND EOD
+    closes (the real-time endpoint returns NA for bonds on our plan)."""
+    start = datetime.now().date() - timedelta(days=14)
+    url = (f"https://eodhd.com/api/eod/US10Y.GBOND?api_token={EODHD_API_KEY}"
+           f"&fmt=json&period=d&from={start}")
+    try:
+        data = requests.get(url, timeout=30).json()
+        closes = [float(d["close"]) for d in data
+                  if isinstance(d.get("close"), (int, float))]
+        if len(closes) < 2:
+            return None
+        return {"level": closes[-1], "chg_bp": (closes[-1] - closes[-2]) * 100}
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def live_quotes(symbols):
+    """Delayed intraday quotes for a tuple of full EODHD symbols (e.g.
+    'SPY.US', 'VIX.INDX'): {symbol: {close, chg_pct}}. chg_pct is today's %
+    change vs previous close. Failed batches just drop out of the dict."""
+    out = {}
+    syms = list(symbols)
+    for i in range(0, len(syms), 15):  # batch limit on the s= parameter
+        chunk = syms[i:i + 15]
+        url = (f"https://eodhd.com/api/real-time/{chunk[0]}"
+               f"?api_token={EODHD_API_KEY}&fmt=json")
+        if len(chunk) > 1:
+            url += "&s=" + ",".join(chunk[1:])
+        try:
+            resp = requests.get(url, timeout=30)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            for q in [data] if isinstance(data, dict) else data:
+                code, close, chg = q.get("code"), q.get("close"), q.get("change_p")
+                if (code and isinstance(close, (int, float))
+                        and isinstance(chg, (int, float))):
+                    out[str(code)] = {"close": float(close), "chg_pct": float(chg)}
+        except Exception:
+            continue
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=12 * 3600)
+def next_earnings(tickers):
+    """Next scheduled report date per plain US ticker (tuple in), from the
+    EODHD earnings calendar: {ticker: 'YYYY-MM-DD'}. Missing = unknown."""
+    out = {}
+    start = datetime.now().date()
+    end = start + timedelta(days=120)
+    syms = list(tickers)
+    for i in range(0, len(syms), 30):
+        chunk = syms[i:i + 30]
+        url = (f"https://eodhd.com/api/calendar/earnings?api_token={EODHD_API_KEY}"
+               f"&symbols={','.join(t + '.US' for t in chunk)}"
+               f"&from={start}&to={end}&fmt=json")
+        try:
+            resp = requests.get(url, timeout=30)
+            if resp.status_code != 200:
+                continue
+            for e in resp.json().get("earnings", []):
+                tkr = str(e.get("code", "")).replace(".US", "")
+                rd = str(e.get("report_date", ""))
+                if tkr and rd and (tkr not in out or rd < out[tkr]):
+                    out[tkr] = rd
+        except Exception:
+            continue
+    return out
+
+
+def explain_move(tkr, quotes, spy_chg):
+    """Today's move vs SPY vs the sector ETF, with a one-word verdict:
+    MARKET (within ~1pp of SPY), SECTOR (tracks its ETF but not SPY),
+    SPECIFIC (diverges from both). None = no quote for the ticker."""
+    q = quotes.get(f"{tkr}.US")
+    if q is None:
+        return None
+    etf = SECTOR_ETF.get(get_sector(tkr))
+    etf_q = quotes.get(f"{etf}.US") if etf else None
+    move = q["chg_pct"]
+    if spy_chg is not None and abs(move - spy_chg) <= MOVE_MATCH_PP:
+        verdict = "MARKET"
+    elif etf_q is not None and abs(move - etf_q["chg_pct"]) <= MOVE_MATCH_PP:
+        verdict = "SECTOR"
+    else:
+        verdict = "SPECIFIC"
+    return {"move": move, "etf": etf,
+            "etf_move": etf_q["chg_pct"] if etf_q else None, "verdict": verdict}
+
+
+def _pct_md(v):
+    """Red/green colored percent for markdown cells."""
+    if v is None:
+        return "—"
+    color = "green" if v > 0 else "red" if v < 0 else "gray"
+    return f":{color}[{v:+.2f}%]"
+
+
+def _verdict_md(verdict):
+    if verdict == "SPECIFIC":
+        return ":violet[**SPECIFIC**]"
+    if verdict == "SECTOR":
+        return ":blue[SECTOR]"
+    return "MARKET"
+
+
+def _earnings_md(date_str):
+    """Earnings cell: loud orange flag inside the soon-window, plain date
+    otherwise, em-dash when the calendar has nothing scheduled."""
+    if not date_str:
+        return "—"
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return "—"
+    days = (d - datetime.now().date()).days
+    label = f"{d.strftime('%b')} {d.day}"
+    if 0 <= days <= EARNINGS_SOON_DAYS:
+        when = "today" if days == 0 else f"in {days}d"
+        return f":orange[**⚠ earnings {when} ({label})**]"
+    return label if days > 0 else "—"
+
+
+def render_awareness_rows(tickers, quotes, spy_chg, earn_dates, tags=None):
+    """One row per ticker: move vs SPY vs sector ETF, verdict, next earnings.
+    Sorted by absolute move, biggest first; quoteless tickers sink to the end."""
+    rows = [(t, explain_move(t, quotes, spy_chg)) for t in tickers]
+    rows.sort(key=lambda r: abs(r[1]["move"]) if r[1] else -1, reverse=True)
+
+    widths = [1.0, 1.0, 1.0, 1.5, 1.2, 2.3]
+    hdr = st.columns(widths)
+    for col, name in zip(hdr, ["Ticker", "Move", "SPY", "Sector ETF",
+                               "Verdict", "Next earnings"]):
+        col.markdown(f"**{name}**")
+    for t, ex in rows:
+        c = st.columns(widths)
+        c[0].markdown(f"**{t}**")
+        if tags and tags.get(t):
+            c[0].caption(tags[t])
+        if ex is None:
+            c[1].write("unavailable")
+        else:
+            c[1].markdown(_pct_md(ex["move"]))
+            c[2].markdown(_pct_md(spy_chg))
+            if ex["etf"]:
+                c[3].markdown(f"{ex['etf']} {_pct_md(ex['etf_move'])}")
+            else:
+                c[3].write("—")
+            c[4].markdown(_verdict_md(ex["verdict"]))
+        c[5].markdown(_earnings_md(earn_dates.get(t)))
+
+
 # ---------- UI ----------
 reg = current_regime()
 regime_banner(reg)
@@ -909,8 +1129,9 @@ if diversify:
     st.sidebar.info(f"Sector diversification ON — max {int(sector_cap)} per sector.")
 
 (tab_scan, tab_flags, tab_portfolio, tab_myport, tab_search,
- tab_ideas) = st.tabs(["Full S&P Scan", "Flags", "Portfolio", "My Portfolio",
-                       "Search Any Ticker", "Ideas"])
+ tab_ideas, tab_market) = st.tabs(["Full S&P Scan", "Flags", "Portfolio",
+                                   "My Portfolio", "Search Any Ticker", "Ideas",
+                                   "Market Awareness"])
 
 with tab_scan:
     if st.button("Scan Full S&P 500", type="primary"):
@@ -1528,3 +1749,113 @@ with tab_ideas:
                      "pnl": "{:+.1%}"}, na_rep="—")
                     .map(pnl_color, subset=["pnl"]),
                 use_container_width=True)
+
+
+with tab_market:
+    st.subheader("Market Awareness")
+    st.caption("Facts-only context for discretionary judgment — dates, prices, "
+               "and yields. **Display-only:** nothing on this tab feeds the "
+               "screener, the flags, or the paper portfolios. Quotes are "
+               "delayed intraday, cached 5 min; calendars cached for hours.")
+
+    # --- Gather tickers first so one quote batch serves the whole tab ---
+    _ideas_log = load_trade_log()
+    idea_tickers = sorted(set(
+        t for t in (str(x).strip().upper()
+                    for x in _ideas_log[_ideas_log["status"] == "open"]["ticker"])
+        if t))
+    held_tickers = set()
+    if "schwab" in st.session_state:
+        for p in st.session_state["schwab"]["positions"]:
+            if p["asset_type"] == "OPTION":
+                tk = str(p.get("underlying") or "").strip().upper()
+            elif p["asset_type"] in ("EQUITY", "ETF", "COLLECTIVE_INVESTMENT",
+                                     "MUTUAL_FUND", "INDEX"):
+                tk = str(p["ticker"]).strip().upper()
+            else:
+                tk = ""  # cash sweeps, bonds — no move to explain
+            if tk:
+                held_tickers.add(tk)
+    position_tickers = sorted(held_tickers | set(idea_tickers))
+
+    all_tickers = sorted(set(position_tickers) | set(THESIS_WATCHLIST))
+    quote_syms = tuple(sorted(
+        {f"{t}.US" for t in all_tickers}
+        | {f"{e}.US" for e in SECTOR_ETF.values()}
+        | {"SPY.US", "VIX.INDX"}))
+    quotes = live_quotes(quote_syms)
+    spy_q = quotes.get("SPY.US")
+    spy_chg = spy_q["chg_pct"] if spy_q else None
+    earn_dates = next_earnings(tuple(all_tickers))
+
+    # --- 1. Macro weather strip ---
+    mc1, mc2, mc3, mc4 = st.columns([3.4, 0.9, 0.9, 0.9])
+    events = macro_calendar()
+    if events is None:
+        mc1.markdown("**Macro calendar:** unavailable")
+    elif not events:
+        mc1.markdown("**Macro calendar:** no FOMC / CPI / NFP / GDP releases "
+                     "in the next 14 days")
+    else:
+        mc1.markdown("**Next 14d:** " + " · ".join(
+            f"**{label}** {d.strftime('%b')} {d.day}" for label, d in events))
+        mc1.caption("US high-importance releases (FOMC, CPI, Nonfarm "
+                    "Payrolls, GDP) from the EODHD economic calendar.")
+    y10 = treasury_10y()
+    if y10:
+        mc2.metric("10Y yield", f"{y10['level']:.2f}%",
+                   f"{y10['chg_bp']:+.1f} bp", delta_color="off")
+    else:
+        mc2.metric("10Y yield", "—", "unavailable", delta_color="off")
+    vix_q = quotes.get("VIX.INDX")
+    if vix_q:
+        mc3.metric("VIX", f"{vix_q['close']:.1f}",
+                   f"{vix_q['chg_pct']:+.1f}%", delta_color="inverse")
+    else:
+        mc3.metric("VIX", "—", "unavailable", delta_color="off")
+    if spy_q:
+        mc4.metric("SPY", f"${spy_q['close']:.2f}",
+                   f"{spy_chg:+.2f}%")
+    else:
+        mc4.metric("SPY", "—", "unavailable", delta_color="off")
+
+    st.divider()
+
+    # --- 2. My positions: catalysts & moves ---
+    st.markdown("#### My Positions — catalysts & moves")
+    if "schwab" not in st.session_state:
+        bc1, bc2 = st.columns([1.3, 3.7])
+        if bc1.button("Load Schwab positions", key="ma_schwab"):
+            try:
+                with st.spinner("Fetching positions..."):
+                    st.session_state["schwab"] = {
+                        "balances": get_balances(),
+                        "positions": get_positions(),
+                        "fetched": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    }
+                st.rerun()
+            except SchwabAuthError as e:
+                st.error(f"Schwab reconnect needed: {e} — run "
+                         f"`python schwab_client.py login` in a terminal.")
+            except Exception as e:
+                st.error(f"Schwab unavailable: {e}")
+        bc2.caption("Schwab not loaded — showing open Ideas tickers only. "
+                    "Option positions count via their underlying.")
+    if not position_tickers:
+        st.info("No holdings or open ideas to track yet.")
+    else:
+        tags = {}
+        for t in position_tickers:
+            src = [s for s, ok in (("held", t in held_tickers),
+                                   ("idea", t in idea_tickers)) if ok]
+            tags[t] = " + ".join(src)
+        render_awareness_rows(position_tickers, quotes, spy_chg,
+                              earn_dates, tags)
+
+    st.divider()
+
+    # --- 3. Thesis watch ---
+    st.markdown("#### Thesis Watch — hyperscalers / AI capex")
+    st.caption("Hardcoded watchlist. These earnings calls (capex guidance) are "
+               "the thesis catalysts for the whole book.")
+    render_awareness_rows(THESIS_WATCHLIST, quotes, spy_chg, earn_dates)
