@@ -992,6 +992,103 @@ def next_earnings(tickers):
     return out
 
 
+# --- Recently-reported earnings (Stage 2.5). Same firewall: display only. ---
+EARNINGS_LOOKBACK_DAYS = 5
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def recent_earnings(tickers):
+    """Prints from the last EARNINGS_LOOKBACK_DAYS days for plain US tickers,
+    via the earnings calendar — the same structured facts as the fundamentals
+    Earnings::History block, but one batched call. {ticker: {report_date,
+    when, actual, estimate, surprise_pct}}. EODHD posts actuals with a lag,
+    so a same-day report legitimately has actual=None."""
+    out = {}
+    end = datetime.now().date()
+    start = end - timedelta(days=EARNINGS_LOOKBACK_DAYS)
+    syms = list(tickers)
+    for i in range(0, len(syms), 30):
+        chunk = syms[i:i + 30]
+        url = (f"https://eodhd.com/api/calendar/earnings?api_token={EODHD_API_KEY}"
+               f"&symbols={','.join(t + '.US' for t in chunk)}"
+               f"&from={start}&to={end}&fmt=json")
+        try:
+            resp = requests.get(url, timeout=30)
+            if resp.status_code != 200:
+                continue
+            for e in resp.json().get("earnings", []):
+                tkr = str(e.get("code", "")).replace(".US", "")
+                rd = str(e.get("report_date", ""))
+                if not tkr or not rd:
+                    continue
+                actual, est, pct = e.get("actual"), e.get("estimate"), e.get("percent")
+                actual = actual if isinstance(actual, (int, float)) else None
+                est = est if isinstance(est, (int, float)) else None
+                if not isinstance(pct, (int, float)):
+                    pct = ((actual - est) / abs(est) * 100
+                           if actual is not None and est else None)
+                if tkr not in out or rd > out[tkr]["report_date"]:
+                    out[tkr] = {"report_date": rd,
+                                "when": str(e.get("before_after_market") or ""),
+                                "actual": actual, "estimate": est,
+                                "surprise_pct": pct}
+        except Exception:
+            continue
+    return out
+
+
+def _edgar_8k_url(tkr):
+    """EDGAR's company browse accepts a ticker in the CIK param — links to the
+    live 8-K filing list without needing a CIK mapping or SEC API call."""
+    return ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany"
+            f"&CIK={tkr}&type=8-K&dateb=&owner=include&count=10")
+
+
+def render_recent_earnings(reported, news):
+    """The just-reported digest: structured EPS facts, the release on EDGAR,
+    and the ticker's pulled coverage under one earnings header."""
+    st.markdown("##### Recently reported (last 5 days)")
+    st.caption("EPS facts are EODHD's structured earnings history — actuals "
+               "can lag a same-day print. **Guidance is the part that moves "
+               "the stock, and it lives in the release text, not in "
+               "structured data** — read the linked release rather than a "
+               "headline summary; nothing here auto-extracts guidance.")
+    when_txt = {"BeforeMarket": " before the open", "AfterMarket": " after the close"}
+    for t, r in sorted(reported.items(),
+                       key=lambda kv: kv[1]["report_date"], reverse=True):
+        try:
+            d = datetime.strptime(r["report_date"], "%Y-%m-%d").date()
+            date_label = f"{d.strftime('%b')} {d.day}"
+        except ValueError:
+            date_label = r["report_date"]
+        label = f"{t} — reported {date_label}{when_txt.get(r['when'], '')}"
+        with st.expander(label, expanded=True):
+            if r["actual"] is not None:
+                est_s = (f" vs est ${r['estimate']:.2f}"
+                         if r["estimate"] is not None else "")
+                line = f"EPS **${r['actual']:.2f}**{est_s}"
+                if r["surprise_pct"] is not None:
+                    pc = ("green" if r["surprise_pct"] > 0
+                          else "red" if r["surprise_pct"] < 0 else "gray")
+                    line += f" · surprise :{pc}[**{r['surprise_pct']:+.1f}%**]"
+                st.markdown(line)
+            elif r["estimate"] is not None:
+                st.markdown(f"EPS est ${r['estimate']:.2f} — actual not "
+                            f"posted to EODHD yet")
+            else:
+                st.markdown("EPS figures unavailable")
+            st.markdown(f"[8-K / press release filings on EDGAR]"
+                        f"({_edgar_8k_url(t)}) — guidance is in there")
+            st.markdown("**Earnings coverage**")
+            items = news.get(t) if news else None
+            if items:
+                render_news_items(items)
+            elif items is None:
+                st.caption("news unavailable")
+            else:
+                st.caption("No ticker-matched coverage pulled.")
+
+
 # --- News layer (Stage 2). Same firewall: read-and-display only. ---
 NEWS_DAYS = 3               # look-back for position news
 NEWS_PER_POSITION = 5       # anti-noise cap per held/idea ticker
@@ -1181,12 +1278,13 @@ def _earnings_md(date_str):
 
 
 def render_awareness_rows(tickers, quotes, spy_chg, earn_dates, tags=None,
-                          news=None):
+                          news=None, suppress_auto=None):
     """One row per ticker: move vs SPY vs sector ETF, verdict, next earnings.
     Sorted by absolute move, biggest first; quoteless tickers sink to the end.
     With `news` ({ticker: items|None}), each row gets an expander of headlines
     — auto-opened when the ticker is on a big SPECIFIC move, so the likely
-    'why' is readable without a click."""
+    'why' is readable without a click. Tickers in `suppress_auto` stay
+    collapsed (their news is already open in the recently-reported digest)."""
     rows = [(t, explain_move(t, quotes, spy_chg)) for t in tickers]
     rows.sort(key=lambda r: abs(r[1]["move"]) if r[1] else -1, reverse=True)
 
@@ -1219,7 +1317,8 @@ def render_awareness_rows(tickers, quotes, spy_chg, earn_dates, tags=None,
             st.caption("news unavailable")
         elif items:
             big_specific = (ex is not None and ex["verdict"] == "SPECIFIC"
-                            and abs(ex["move"]) >= AUTO_EXPAND_MOVE)
+                            and abs(ex["move"]) >= AUTO_EXPAND_MOVE
+                            and not (suppress_auto and t in suppress_auto))
             label = f"{t} news ({len(items)})"
             if big_specific:
                 label += f" — {ex['move']:+.1f}% SPECIFIC move"
@@ -2009,8 +2108,13 @@ with tab_market:
             tags[t] = " + ".join(src)
         with st.spinner("Pulling position news..."):
             pos_news = {t: position_news(t) for t in position_tickers}
+        reported = recent_earnings(tuple(position_tickers))
+        if reported:
+            render_recent_earnings(reported, pos_news)
+            st.markdown("")  # breathing room before the moves table
         render_awareness_rows(position_tickers, quotes, spy_chg,
-                              earn_dates, tags, news=pos_news)
+                              earn_dates, tags, news=pos_news,
+                              suppress_auto=set(reported))
 
     st.divider()
 
