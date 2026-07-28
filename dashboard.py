@@ -1,9 +1,11 @@
 import os
+import re
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from config import EODHD_API_KEY
 from data_layer import get_valuation, get_sector, refresh_universe_prices
 from explore_constituents import get_sp500_membership
@@ -990,6 +992,141 @@ def next_earnings(tickers):
     return out
 
 
+# --- News layer (Stage 2). Same firewall: read-and-display only. ---
+NEWS_DAYS = 3               # look-back for position news
+NEWS_PER_POSITION = 5       # anti-noise cap per held/idea ticker
+NEWS_PER_THESIS = 3         # anti-noise cap per thesis ticker
+THESIS_NEWS_DAYS = 7        # wider window — capex stories are less frequent
+NEWS_WRAP_SYMBOLS = 12      # > this many tagged tickers = market-wrap spam
+NEWS_DUP_JACCARD = 0.7      # title token overlap that counts as syndication
+AUTO_EXPAND_MOVE = 3.0      # |move| % on a SPECIFIC verdict that auto-opens news
+
+# Headline/content relevance filter for the thesis-break layer.
+THESIS_KEYWORDS = [
+    "capex", "capital expenditure", "capital spending", "data center",
+    "datacenter", "data-center", "ai infrastructure", "gpu",
+    "cloud spending", "hyperscaler",
+]
+
+# EODHD tags stories with every mentioned/related symbol, so a Corning story
+# that discusses data centers gets tagged NVDA and would pass the keyword
+# filter. The watchlist is hardcoded, so require the company itself in the
+# headline to keep the thesis layer about the thesis names.
+THESIS_TITLE_NAMES = {
+    "MSFT": ["microsoft", "msft"],
+    "GOOGL": ["google", "alphabet", "googl"],
+    "AMZN": ["amazon", "amzn"],
+    "META": ["meta"],
+    "NVDA": ["nvidia", "nvda"],
+}
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _news_raw(symbol, days, limit):
+    """Raw EODHD news items for one full symbol (e.g. 'SNDK.US'), newest
+    first. None = endpoint unavailable (vs [] = genuinely no news)."""
+    start = datetime.now().date() - timedelta(days=days)
+    url = (f"https://eodhd.com/api/news?api_token={EODHD_API_KEY}"
+           f"&s={symbol}&from={start}&to={datetime.now().date()}"
+           f"&limit={limit}&fmt=json")
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
+def _title_tokens(title):
+    return set(re.sub(r"[^a-z0-9 ]", " ", str(title).lower()).split())
+
+
+def _domain(link):
+    host = urlparse(str(link)).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _rel_time(date_str):
+    """'4h ago' style age for an ISO news timestamp; '' if unparseable."""
+    try:
+        ts = pd.Timestamp(date_str)
+        now = (pd.Timestamp.now(tz="UTC") if ts.tzinfo is not None
+               else pd.Timestamp.now())
+        mins = max(0, int((now - ts).total_seconds() // 60))
+    except (ValueError, TypeError):
+        return ""
+    if mins < 60:
+        return f"{mins}m ago"
+    if mins < 48 * 60:
+        return f"{mins // 60}h ago"
+    return f"{mins // (24 * 60)}d ago"
+
+
+def _clean_news(raw, tkr):
+    """Apply the anti-noise rules to raw items for one ticker: must be tagged
+    with the ticker, must link out, not a many-symbol market wrap, syndicated
+    near-duplicates collapsed (newest kept). Returns display-ready dicts."""
+    kept, seen_tokens = [], []
+    for it in raw:
+        title, link = str(it.get("title", "")).strip(), str(it.get("link", "")).strip()
+        if not title or not link.startswith("http"):
+            continue
+        symbols = [str(s).upper() for s in (it.get("symbols") or [])]
+        if not any(s == f"{tkr}.US" or s == tkr for s in symbols):
+            continue
+        if len(symbols) > NEWS_WRAP_SYMBOLS:
+            continue
+        toks = _title_tokens(title)
+        if not toks or any(len(toks & prev) / len(toks | prev) >= NEWS_DUP_JACCARD
+                           for prev in seen_tokens):
+            continue
+        seen_tokens.append(toks)
+        pol = (it.get("sentiment") or {}).get("polarity")
+        kept.append({
+            "title": title, "link": link, "domain": _domain(link),
+            "when": _rel_time(it.get("date")),
+            "sent": f"{pol:+.2f}" if isinstance(pol, (int, float)) else "—",
+            "content": str(it.get("content", "")),
+        })
+    return kept
+
+
+def position_news(tkr):
+    """Recent ticker-matched news for one position, capped and de-noised.
+    None = news endpoint unavailable."""
+    raw = _news_raw(f"{tkr}.US", NEWS_DAYS, 20)
+    if raw is None:
+        return None
+    return _clean_news(raw, tkr)[:NEWS_PER_POSITION]
+
+
+def thesis_news(tkr):
+    """Capex/AI-infrastructure-relevant news only, for the thesis watchlist.
+    Keyword-matched on title + content; None = unavailable."""
+    raw = _news_raw(f"{tkr}.US", THESIS_NEWS_DAYS, 50)
+    if raw is None:
+        return None
+    names = THESIS_TITLE_NAMES.get(tkr, [tkr.lower()])
+    out = []
+    for it in _clean_news(raw, tkr):
+        title = it["title"].lower()
+        text = f"{title} {it['content']}".lower()
+        if (any(n in title for n in names)
+                and any(k in text for k in THESIS_KEYWORDS)):
+            out.append(it)
+        if len(out) >= NEWS_PER_THESIS:
+            break
+    return out
+
+
+def render_news_items(items):
+    for it in items:
+        st.markdown(f"[{it['title']}]({it['link']})")
+        st.caption(f"{it['domain']} · {it['when']} · sent {it['sent']}")
+
+
 def explain_move(tkr, quotes, spy_chg):
     """Today's move vs SPY vs the sector ETF, with a one-word verdict:
     MARKET (within ~1pp of SPY), SECTOR (tracks its ETF but not SPY),
@@ -1043,9 +1180,13 @@ def _earnings_md(date_str):
     return label if days > 0 else "—"
 
 
-def render_awareness_rows(tickers, quotes, spy_chg, earn_dates, tags=None):
+def render_awareness_rows(tickers, quotes, spy_chg, earn_dates, tags=None,
+                          news=None):
     """One row per ticker: move vs SPY vs sector ETF, verdict, next earnings.
-    Sorted by absolute move, biggest first; quoteless tickers sink to the end."""
+    Sorted by absolute move, biggest first; quoteless tickers sink to the end.
+    With `news` ({ticker: items|None}), each row gets an expander of headlines
+    — auto-opened when the ticker is on a big SPECIFIC move, so the likely
+    'why' is readable without a click."""
     rows = [(t, explain_move(t, quotes, spy_chg)) for t in tickers]
     rows.sort(key=lambda r: abs(r[1]["move"]) if r[1] else -1, reverse=True)
 
@@ -1070,6 +1211,20 @@ def render_awareness_rows(tickers, quotes, spy_chg, earn_dates, tags=None):
                 c[3].write("—")
             c[4].markdown(_verdict_md(ex["verdict"]))
         c[5].markdown(_earnings_md(earn_dates.get(t)))
+
+        if news is None:
+            continue
+        items = news.get(t)
+        if items is None:
+            st.caption("news unavailable")
+        elif items:
+            big_specific = (ex is not None and ex["verdict"] == "SPECIFIC"
+                            and abs(ex["move"]) >= AUTO_EXPAND_MOVE)
+            label = f"{t} news ({len(items)})"
+            if big_specific:
+                label += f" — {ex['move']:+.1f}% SPECIFIC move"
+            with st.expander(label, expanded=big_specific):
+                render_news_items(items)
 
 
 # ---------- UI ----------
@@ -1753,10 +1908,13 @@ with tab_ideas:
 
 with tab_market:
     st.subheader("Market Awareness")
-    st.caption("Facts-only context for discretionary judgment — dates, prices, "
-               "and yields. **Display-only:** nothing on this tab feeds the "
-               "screener, the flags, or the paper portfolios. Quotes are "
-               "delayed intraday, cached 5 min; calendars cached for hours.")
+    st.caption("Context for discretionary judgment — dates, prices, yields, "
+               "and ticker-matched headlines. **Display-only:** nothing on "
+               "this tab feeds the screener, the flags, or the paper "
+               "portfolios. Quotes delayed intraday, cached 5 min; news "
+               "cached 15 min; calendars cached for hours. Headlines link to "
+               "the original source; *sent* chips are EODHD's algorithmic "
+               "polarity (−1…+1) — reference only, never a signal.")
 
     # --- Gather tickers first so one quote batch serves the whole tab ---
     _ideas_log = load_trade_log()
@@ -1849,13 +2007,20 @@ with tab_market:
             src = [s for s, ok in (("held", t in held_tickers),
                                    ("idea", t in idea_tickers)) if ok]
             tags[t] = " + ".join(src)
+        with st.spinner("Pulling position news..."):
+            pos_news = {t: position_news(t) for t in position_tickers}
         render_awareness_rows(position_tickers, quotes, spy_chg,
-                              earn_dates, tags)
+                              earn_dates, tags, news=pos_news)
 
     st.divider()
 
     # --- 3. Thesis watch ---
     st.markdown("#### Thesis Watch — hyperscalers / AI capex")
     st.caption("Hardcoded watchlist. These earnings calls (capex guidance) are "
-               "the thesis catalysts for the whole book.")
-    render_awareness_rows(THESIS_WATCHLIST, quotes, spy_chg, earn_dates)
+               "the thesis catalysts for the whole book. News below is "
+               "filtered to capex / data-center / AI-infrastructure "
+               "relevance only — the thesis-break layer.")
+    with st.spinner("Pulling thesis news..."):
+        th_news = {t: thesis_news(t) for t in THESIS_WATCHLIST}
+    render_awareness_rows(THESIS_WATCHLIST, quotes, spy_chg, earn_dates,
+                          news=th_news)
