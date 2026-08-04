@@ -73,6 +73,21 @@ SCAN_STALE_WARN_DAYS = 7         # warn when the scores snapshot is older than t
 RV_WINDOW = 30           # trading days for the realized-vol proxy
 REQUEST_SLEEP_SEC = 0.55 # throttle: ~110 chain calls/min, under Schwab's ~120 limit
 
+# Upper sanity bound on a normalized IV, in DECIMAL (5.0 = 500%). Schwab's -999
+# sentinel is caught by the >0 test, but nothing bounded the top end, so a thin
+# or stale strike's garbage model mark (observed shapes: volatility=1609.739 ->
+# 16.09, volatility=99999 -> 999.99) would land in iv_history.csv as a real
+# reading. That history can never be regenerated, so one junk row permanently
+# skews that name's IV-rank percentiles. 500% is far above any genuine ATM
+# 30-DTE quote — even a biotech binary or a squeeze prints well under it — so
+# the band only ever catches unambiguous junk.
+IV_SANITY_MAX = 5.0
+
+# Count of contracts dropped for out-of-band IV, per run. Module-level so
+# fetch_chain can report without changing its documented return contract;
+# run() resets it and folds the total into the run-log line.
+_iv_out_of_band = 0
+
 
 # --------------------------------------------------------------------------- #
 # Normalized contract — the ONLY Schwab-specific parsing lives in the adapter
@@ -113,6 +128,30 @@ def session_date_for(contract: Contract, fallback: date) -> date:
 # --------------------------------------------------------------------------- #
 # PURE LOGIC — no repo or network dependency
 # --------------------------------------------------------------------------- #
+
+def normalize_iv(volatility_pct, iv_max: float = IV_SANITY_MAX) -> Optional[float]:
+    """Schwab's `volatility` (a PERCENT, e.g. 29.062) -> decimal IV (0.29062),
+    or None when the value is unusable and the contract must be dropped.
+
+    Rejects, all treated as missing rather than recorded:
+      - None / non-numeric
+      - <= 0, which is Schwab's -999.0 missing-value sentinel
+      - > iv_max, i.e. a garbage model mark (see IV_SANITY_MAX)
+
+    Dropping is the right call rather than clamping: a clamped 500% would be a
+    fabricated observation in a history that can never be corrected, whereas a
+    missing contract simply falls through to the next strike or leaves the name
+    out for the day — visible in the drop log either way."""
+    if volatility_pct is None:
+        return None
+    try:
+        iv = float(volatility_pct) / 100.0
+    except (TypeError, ValueError):
+        return None
+    if iv <= 0 or iv > iv_max:
+        return None
+    return iv
+
 
 def realized_vol(closes: list[float], window: int = RV_WINDOW,
                  trading_days: int = 252) -> Optional[float]:
@@ -372,8 +411,10 @@ def fetch_chain(ticker: str) -> tuple[float, list[Contract]]:
     ask, delta, gamma, theta, vega, volatility (IV in PERCENT — 29.062, divided
     by 100 here), openInterest, daysToExpiration, strikePrice. Expiry is parsed
     from the map key, not the contract's 'expirationDate' (an ISO timestamp).
-    Schwab uses -999.0 as a missing-value sentinel on volatility/greeks;
-    contracts with non-positive IV are dropped rather than recorded as garbage."""
+    IV is run through normalize_iv, which drops both Schwab's -999.0 sentinel
+    and out-of-band garbage marks; the out-of-band count is logged per ticker
+    and accumulated into the run total."""
+    global _iv_out_of_band
     import schwab_client
     today = date.today()
     data = schwab_client.get_option_chain(
@@ -384,6 +425,7 @@ def fetch_chain(ticker: str) -> tuple[float, list[Contract]]:
     )
     spot = float(data.get("underlyingPrice") or 0.0)
     contracts: list[Contract] = []
+    dropped_out_of_band = 0
     for exp_key, strikes in (data.get("callExpDateMap") or {}).items():
         exp_str, _, dte_str = exp_key.partition(":")
         try:
@@ -393,15 +435,24 @@ def fetch_chain(ticker: str) -> tuple[float, list[Contract]]:
             continue
         for _strike, quotes in strikes.items():
             for q in quotes:
-                iv_pct = q.get("volatility")
-                if iv_pct is None or float(iv_pct) <= 0:   # -999.0 sentinel etc.
+                iv = normalize_iv(q.get("volatility"))
+                if iv is None:
+                    # Separate the junk-mark case from the ordinary -999 sentinel
+                    # so a name vanishing from the history is visible, not silent.
+                    raw = q.get("volatility")
+                    if raw is not None:
+                        try:
+                            if float(raw) / 100.0 > IV_SANITY_MAX:
+                                dropped_out_of_band += 1
+                        except (TypeError, ValueError):
+                            pass
                     continue
                 try:
                     contracts.append(Contract(
                         expiry=expiry,
                         dte=int(q.get("daysToExpiration", key_dte)),
                         strike=float(q["strikePrice"]),
-                        iv=float(iv_pct) / 100.0,
+                        iv=iv,
                         delta=float(q.get("delta", 0.0)),
                         gamma=(float(q["gamma"]) if q.get("gamma") is not None else None),
                         theta=float(q.get("theta", 0.0)),
@@ -415,6 +466,11 @@ def fetch_chain(ticker: str) -> tuple[float, list[Contract]]:
                     ))
                 except (KeyError, TypeError, ValueError):
                     continue
+    if dropped_out_of_band:
+        _iv_out_of_band += dropped_out_of_band
+        log.warning("%s: dropped %d contract(s) with out-of-band IV "
+                    "(>%.0f%% — garbage model mark, not recorded)",
+                    ticker, dropped_out_of_band, IV_SANITY_MAX * 100)
     return spot, contracts
 
 
@@ -461,8 +517,10 @@ def _row_for(ticker: str, as_of: date) -> Optional[dict]:
 def run(as_of: Optional[date] = None) -> pd.DataFrame:
     """Build the watchlist, snapshot each name, append to history. One name failing
     never kills the run. Returns the rows written (for logging/inspection)."""
+    global _iv_out_of_band
     as_of = as_of or date.today()
     IV_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _iv_out_of_band = 0
 
     watchlist = build_watchlist(get_universe(), get_composite_scores(),
                                 get_earnings_calendar())
@@ -492,7 +550,8 @@ def run(as_of: Optional[date] = None) -> pd.DataFrame:
         combined.to_csv(IV_HISTORY_PATH, index=False)
 
     msg = (f"{datetime.now().isoformat(timespec='seconds')} | {as_of} | "
-           f"watchlist={len(watchlist)} written={len(rows)} failures={failures}")
+           f"watchlist={len(watchlist)} written={len(rows)} failures={failures} "
+           f"iv_out_of_band={_iv_out_of_band}")
     with open(RUN_LOG_PATH, "a", encoding="utf-8") as f:
         f.write(msg + "\n")
     log.info(msg)

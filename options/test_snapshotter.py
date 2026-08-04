@@ -28,7 +28,8 @@ from options.snapshotter import (Contract, realized_vol, select_atm_iv30,
                                  session_date_for, interpolate_iv30,
                                  atm_iv_at_each_expiry,
                                  atm_contract_at_each_expiry,
-                                 constant_maturity_iv30)
+                                 constant_maturity_iv30,
+                                 normalize_iv, IV_SANITY_MAX)
 
 fails = []
 
@@ -44,6 +45,42 @@ def mk(dte, strike, iv=0.30, oi=100):
                     strike=strike, iv=iv, delta=0.5, gamma=0.01, theta=-0.05,
                     vega=0.10, bid=1.0, ask=1.2, open_interest=oi)
 
+
+# --------------------------------------------------------------------------- #
+# normalize_iv — CORRUPTION GUARD: Schwab's -999 sentinel was the only value
+# ever rejected, so a garbage model mark on a thin/stale strike (observed:
+# volatility=1609.739) was written to iv_history.csv as a 1609.7% reading.
+# That history can never be regenerated, so one junk row permanently skews the
+# name's IV-rank percentiles. Values must be DROPPED, never clamped — a clamp
+# would fabricate an observation that looks real forever after.
+# --------------------------------------------------------------------------- #
+check("iv band: the -999 sentinel is dropped", normalize_iv(-999.0) is None)
+check("iv band: zero is dropped", normalize_iv(0.0) is None)
+check("iv band: None is dropped", normalize_iv(None) is None)
+check("iv band: non-numeric is dropped", normalize_iv("n/a") is None)
+
+# a real quote survives, converted percent -> decimal
+check("iv band: 29.062 kept as 0.29062",
+      normalize_iv(29.062) is not None and abs(normalize_iv(29.062) - 0.29062) < 1e-12)
+
+# the junk values that motivated the band
+check("iv band: 1609.739 DROPPED (was recorded as 16.09 before the fix)",
+      normalize_iv(1609.739) is None)
+check("iv band: 99999 DROPPED (was recorded as 999.99 before the fix)",
+      normalize_iv(99999.0) is None)
+
+# boundary asserted from BOTH sides so the band can't silently drift
+check("iv band: 450% is inside the band and kept",
+      normalize_iv(450.0) is not None and abs(normalize_iv(450.0) - 4.5) < 1e-12)
+check("iv band: exactly at the max is kept (inclusive upper bound)",
+      normalize_iv(IV_SANITY_MAX * 100) is not None)
+check("iv band: a hair above the max is dropped",
+      normalize_iv(IV_SANITY_MAX * 100 + 0.001) is None)
+check("iv band: the max is 5.0 decimal / 500%", IV_SANITY_MAX == 5.0)
+
+# extreme-but-real event vol must survive — the band exists to catch junk, not
+# to censor a genuine binary/squeeze print
+check("iv band: 300% event vol survives", normalize_iv(300.0) is not None)
 
 # --------------------------------------------------------------------------- #
 # realized_vol
