@@ -1,0 +1,28 @@
+# Direct third-party dependencies, pinned to the versions this system is
+# currently verified against. Python 3.14.3.
+#
+# Direct only — every package here is imported by name somewhere in the repo's
+# own .py files. Transitive dependencies (altair, pyarrow, authlib, httpx,
+# curl_cffi, ...) are deliberately NOT pinned here; pip resolves them, and
+# freezing them would turn a routine upgrade into a merge conflict.
+# Regenerate the direct list with:
+#   grep -rhE "^\s*(import|from) " --include=*.py . | grep -v ./venv/
+#
+# install:  python -m pip install -r requirements.txt
+
+# --- data & numerics (core screener, backtests, options satellite) ---
+numpy==2.4.6
+pandas==3.0.3
+
+# --- dashboard UI ---
+streamlit==1.58.0
+
+# --- market data ---
+requests==2.34.2          # EODHD REST calls (prices, fundamentals, earnings calendar)
+yfinance==1.4.1           # data_layer fallback price source
+
+# --- broker (READ-ONLY: quotes, chains, balances, positions; no order code) ---
+schwab-py==1.5.1          # imported as `schwab`
+
+# --- options satellite ticket schema ---
+pydantic==2.13.4          # v2 API (computed_field, model_fields); v1 will not work
