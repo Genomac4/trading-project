@@ -144,6 +144,26 @@ def get_balances():
     return out
 
 
+def get_option_chain(symbol, from_date=None, to_date=None, strike_count=None,
+                     calls_only=True):
+    """Raw option-chain JSON for one underlying. (GET /marketdata/chains)
+
+    Read-only market data — same firewall as everything else here: a GET,
+    no order capability. from_date/to_date (datetime.date) bound the expiries
+    and strike_count limits strikes around ATM, keeping payloads small."""
+    c = _client()
+    kwargs = {}
+    if calls_only:
+        kwargs["contract_type"] = c.Options.ContractType.CALL
+    if from_date is not None:
+        kwargs["from_date"] = from_date
+    if to_date is not None:
+        kwargs["to_date"] = to_date
+    if strike_count is not None:
+        kwargs["strike_count"] = strike_count
+    return _get_json(c.get_option_chain(symbol, **kwargs), "option chain")
+
+
 def login():
     """One-time interactive OAuth: opens a browser to Schwab's login page and
     captures the callback, writing the token to TOKEN_PATH. Falls back to the

@@ -18,3 +18,9 @@ data/scan_history/*
 data/paper_portfolio/*
 !data/paper_portfolio/*.csv
 !data/paper_portfolio/.gitkeep
+# Options IV history accrues daily and can NEVER be backfilled — losing it to a
+# machine wipe would restart the IV-rank clock from zero, so track the CSV.
+!data/options/
+data/options/*
+!data/options/*.csv
+!data/options/.gitkeep

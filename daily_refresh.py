@@ -1,9 +1,14 @@
 """
-daily_refresh.py — headless daily price refresh.
+daily_refresh.py — headless daily refresh: prices, then the IV snapshot.
 
-Runs the fast bulk EOD top-up (data_layer.refresh_universe_prices) over the
-current S&P 500 members and appends a timestamped line to data/refresh_log.txt.
-No user interaction — intended to be run once a day by Windows Task Scheduler.
+Step 1 runs the fast bulk EOD top-up (data_layer.refresh_universe_prices) over
+the current S&P 500 members. Step 2 runs the options satellite's IV snapshotter
+(options/snapshotter.py), which appends today's ATM-IV30 readings to an
+append-only history that can never be backfilled. Each step logs its own line
+to data/refresh_log.txt and neither can take the other down. No user
+interaction — intended to be run once a day by Windows Task Scheduler.
+NOTE: step 2 needs a valid Schwab token (7-day refresh cycle) — when it starts
+failing with auth errors, run `python schwab_client.py login`.
 
 One bulk call tops up the whole list to the latest close; recently-listed or
 very stale names fall back to a per-ticker full-history fetch automatically.
@@ -46,7 +51,7 @@ def _fetch_and_save(ticker):
     return None
 
 
-def main():
+def refresh_prices_step():
     start = datetime.now()
     try:
         members = get_sp500_membership()
@@ -62,6 +67,29 @@ def main():
         _log(f"ERROR {type(e).__name__}: {e}")
         _log("TRACE " + traceback.format_exc().replace("\n", " | "))
         return 1
+
+
+def snapshot_iv_step():
+    """Options satellite: accrue today's IV history (it can never be
+    backfilled, so a silently skipped day is permanently lost — hence its
+    failure also fails the run so Task Scheduler shows it). Runs after the
+    price refresh so the realized-vol proxy sees today's closes; kept
+    independent so neither step can take the other down."""
+    try:
+        from options import snapshotter
+        written = snapshotter.run()
+        _log(f"OK  iv-snapshot rows={len(written)}")
+        return 0
+    except Exception as e:
+        _log(f"ERROR iv-snapshot {type(e).__name__}: {e}")
+        _log("TRACE " + traceback.format_exc().replace("\n", " | "))
+        return 1
+
+
+def main():
+    rc_prices = refresh_prices_step()
+    rc_iv = snapshot_iv_step()
+    return 1 if (rc_prices or rc_iv) else 0
 
 
 if __name__ == "__main__":
