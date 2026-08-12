@@ -31,6 +31,28 @@ class SchwabAuthError(Exception):
     """Token missing/expired/invalid — user needs to redo the login flow."""
 
 
+# schwab-py refreshes the 30-minute access token from under us, via authlib.
+# authlib is schwab-py's dependency rather than ours, so import its error type
+# defensively: if the path ever moves, _is_auth_failure falls back to matching
+# the OAuth error codes in the message instead of breaking this module.
+try:
+    from authlib.integrations.base_client.errors import OAuthError as _OAuthError
+except Exception:
+    _OAuthError = ()
+
+# OAuth error codes Schwab returns for a dead session, as they appear in the
+# raised exception's text ("invalid_grant" = refresh token expired or revoked).
+_AUTH_FAILURE_MARKERS = ("invalid_grant", "invalid_client",
+                         "unsupported_token_type", "refresh token is invalid")
+
+
+def _is_auth_failure(exc):
+    """True if `exc` is an OAuth failure — i.e. re-login is the fix."""
+    if _OAuthError and isinstance(exc, _OAuthError):
+        return True
+    return any(m in str(exc).lower() for m in _AUTH_FAILURE_MARKERS)
+
+
 def _client():
     """Client from the stored token file only — never starts a login flow
     (the dashboard must not try to open a browser from inside Streamlit)."""
@@ -41,6 +63,31 @@ def _client():
         return client_from_token_file(TOKEN_PATH, SCHWAB_APP_KEY, SCHWAB_APP_SECRET)
     except Exception as e:
         raise SchwabAuthError(f"Could not load the Schwab token ({e}). {RELOGIN_HINT}")
+
+
+def _get(fn, what, *args, **kwargs):
+    """Issue one schwab-py GET and unwrap it, mapping EVERY auth failure to
+    SchwabAuthError — including the one that happens inside the request.
+
+    _client() only reads the token file; it succeeds even when the session is
+    dead. The stored access token lives 30 minutes, so schwab-py renews it
+    lazily on the first request, and once the 7-day refresh token has expired it
+    is that renewal — not the GET — that fails, raising an authlib OAuthError
+    from under the httpx client. That happens after _client() has already
+    returned, so it bypasses its try/except and reached callers as a raw
+    traceback (the dashboard's My Portfolio tab showed a stack trace instead of
+    the reconnect banner). Non-auth exceptions still propagate untouched."""
+    try:
+        resp = fn(*args, **kwargs)
+    except SchwabAuthError:
+        raise
+    except Exception as e:
+        if _is_auth_failure(e):
+            raise SchwabAuthError(
+                f"Schwab rejected the {what} request — the session has expired "
+                f"({e}). {RELOGIN_HINT}") from e
+        raise
+    return _get_json(resp, what)
 
 
 def _get_json(resp, what):
@@ -59,14 +106,14 @@ def get_accounts():
     """Account numbers on file: list of {'accountNumber', 'hashValue'} dicts.
     (GET /accounts/accountNumbers)"""
     c = _client()
-    return _get_json(c.get_account_numbers(), "account numbers")
+    return _get(c.get_account_numbers, "account numbers")
 
 
 def _all_accounts_with_positions():
     """Every account with its positions attached. (GET /accounts?fields=positions)"""
     c = _client()
-    return _get_json(
-        c.get_accounts(fields=c.Account.Fields.POSITIONS), "accounts/positions")
+    return _get(c.get_accounts, "accounts/positions",
+                fields=c.Account.Fields.POSITIONS)
 
 
 def _f(d, *keys):
@@ -161,7 +208,7 @@ def get_option_chain(symbol, from_date=None, to_date=None, strike_count=None,
         kwargs["to_date"] = to_date
     if strike_count is not None:
         kwargs["strike_count"] = strike_count
-    return _get_json(c.get_option_chain(symbol, **kwargs), "option chain")
+    return _get(c.get_option_chain, "option chain", symbol, **kwargs)
 
 
 def login():
