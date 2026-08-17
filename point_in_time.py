@@ -48,11 +48,24 @@ def _fetch_raw(ticker):
     return data
 
 
-def _build_availability_map(data):
+_AVAIL_MEM = {}
+
+
+def _build_availability_map(data, ticker=None):
     """
     Build {fiscal_year_end_date -> date_it_became_public} for annual data.
     Uses real reportDate from Earnings where available, else fiscal_end + 90d.
+
+    The result depends only on `data`, which is fixed per ticker for the life of
+    the process, so passing `ticker` memoizes it. That is a pure speed-up: the
+    parse is ~300 pd.to_datetime calls and dominated every point-in-time lookup
+    (~85% of runtime), which is what made a per-rebalance-date as-of lookup
+    prohibitively slow. Callers that omit `ticker` get the original uncached
+    behaviour.
     """
+    if ticker is not None and ticker in _AVAIL_MEM:
+        return _AVAIL_MEM[ticker]
+
     earnings = data.get("Earnings", {}).get("History", {})
 
     # Map each fiscal-period-end to its actual reportDate (8-K filing date)
@@ -62,6 +75,8 @@ def _build_availability_map(data):
         if rd:
             report_dates[pd.to_datetime(period)] = pd.to_datetime(rd)
 
+    if ticker is not None:
+        _AVAIL_MEM[ticker] = report_dates
     return report_dates
 
 
@@ -85,7 +100,7 @@ def point_in_time_fundamentals(ticker, as_of_date, _cache={}):
     if data is None:
         return None
 
-    report_dates = _build_availability_map(data)
+    report_dates = _build_availability_map(data, ticker)
 
     # Annual financial statements, keyed by fiscal-year-end date
     fin = data.get("Financials", {})

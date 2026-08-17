@@ -1,3 +1,5 @@
+import bisect
+
 import pandas as pd
 from point_in_time import (
     _fetch_raw, _build_availability_map, _quarter_availability,
@@ -11,6 +13,78 @@ YOY_MIN_DAYS = 310
 YOY_MAX_DAYS = 420
 
 
+_ANNUAL_MEM = {}
+
+
+def _extract_annual(income, balance, cashflow, fy_end):
+    """Pull the F-score input fields for one fiscal year into the shared dict
+    shape. Was a closure inside pit_two_years; lifted out unchanged so the
+    as-of timeline below can reuse it instead of restating the field mapping."""
+    key_year = str(fy_end.year)
+
+    def find(stmt):
+        for k in stmt:
+            if k.startswith(key_year):
+                return stmt[k]
+        return {}
+
+    inc, bal, cf = find(income), find(balance), find(cashflow)
+
+    def f(v):
+        try:
+            return float(v) if v is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "Revenue": f(inc.get("totalRevenue")),
+        "NetIncome": f(inc.get("netIncome")),
+        "GrossProfit": f(inc.get("grossProfit")),
+        "CostOfRevenue": f(inc.get("costOfRevenue")),
+        "TotalAssets": f(bal.get("totalAssets")),
+        "CurrentAssets": f(bal.get("totalCurrentAssets")),
+        "CurrentLiabilities": f(bal.get("totalCurrentLiabilities")),
+        "LongTermDebt": f(bal.get("longTermDebt")),
+        "SharesOutstanding": f(bal.get("commonStockSharesOutstanding")),
+        "OperatingCashFlow": f(cf.get("totalCashFromOperatingActivities")),
+    }
+
+
+def _annual_periods(ticker):
+    """Shared ANNUAL machinery, parsed once per ticker: returns
+    (income, balance, cashflow, [(fiscal_year_end, date_available), ...]) sorted
+    by fiscal year-end, or None if unusable.
+
+    `date_available` is the same rule the annual path has always applied: the
+    earliest reportDate on/after the fiscal year-end, else fiscal_end + 90 days.
+    Splitting it out (from pit_two_years) makes availability a per-ticker fact
+    rather than something re-derived on every as-of lookup."""
+    if ticker in _ANNUAL_MEM:
+        return _ANNUAL_MEM[ticker]
+
+    ctx = None
+    data = _fetch_raw(ticker)
+    if data is not None:
+        fin = data.get("Financials", {})
+        income = fin.get("Income_Statement", {}).get("yearly", {})
+        balance = fin.get("Balance_Sheet", {}).get("yearly", {})
+        cashflow = fin.get("Cash_Flow", {}).get("yearly", {})
+        if income:
+            report_dates = _build_availability_map(data, ticker)
+            periods = []
+            for date_str in income.keys():
+                fy_end = pd.to_datetime(date_str)
+                later = [rd for pe, rd in report_dates.items()
+                         if pe >= fy_end and rd >= fy_end]
+                avail = min(later) if later else fy_end + pd.Timedelta(days=90)
+                periods.append((fy_end, avail))
+            periods.sort()
+            ctx = (income, balance, cashflow, periods)
+
+    _ANNUAL_MEM[ticker] = ctx
+    return ctx
+
+
 def pit_two_years(ticker, as_of_date):
     """
     Return (current, prior) annual fundamentals dicts as known on
@@ -19,26 +93,12 @@ def pit_two_years(ticker, as_of_date):
     fewer than two years are available.
     """
     as_of = pd.Timestamp(as_of_date)
-    data = _fetch_raw(ticker)
-    if data is None:
+    ctx = _annual_periods(ticker)
+    if ctx is None:
         return None, None
+    income, balance, cashflow, periods = ctx
 
-    report_dates = _build_availability_map(data)
-    fin = data.get("Financials", {})
-    income = fin.get("Income_Statement", {}).get("yearly", {})
-    balance = fin.get("Balance_Sheet", {}).get("yearly", {})
-    cashflow = fin.get("Cash_Flow", {}).get("yearly", {})
-    if not income:
-        return None, None
-
-    available_years = []
-    for date_str in income.keys():
-        fy_end = pd.to_datetime(date_str)
-        later = [rd for pe, rd in report_dates.items() if pe >= fy_end and rd >= fy_end]
-        avail = min(later) if later else fy_end + pd.Timedelta(days=90)
-        if avail <= as_of:
-            available_years.append(fy_end)
-
+    available_years = [fy_end for fy_end, avail in periods if avail <= as_of]
     if len(available_years) < 2:
         return None, None
 
@@ -46,37 +106,8 @@ def pit_two_years(ticker, as_of_date):
     curr_end = available_years[-1]
     prev_end = available_years[-2]
 
-    def extract(fy_end):
-        key_year = str(fy_end.year)
-
-        def find(stmt):
-            for k in stmt:
-                if k.startswith(key_year):
-                    return stmt[k]
-            return {}
-
-        inc, bal, cf = find(income), find(balance), find(cashflow)
-
-        def f(v):
-            try:
-                return float(v) if v is not None else None
-            except (ValueError, TypeError):
-                return None
-
-        return {
-            "Revenue": f(inc.get("totalRevenue")),
-            "NetIncome": f(inc.get("netIncome")),
-            "GrossProfit": f(inc.get("grossProfit")),
-            "CostOfRevenue": f(inc.get("costOfRevenue")),
-            "TotalAssets": f(bal.get("totalAssets")),
-            "CurrentAssets": f(bal.get("totalCurrentAssets")),
-            "CurrentLiabilities": f(bal.get("totalCurrentLiabilities")),
-            "LongTermDebt": f(bal.get("longTermDebt")),
-            "SharesOutstanding": f(bal.get("commonStockSharesOutstanding")),
-            "OperatingCashFlow": f(cf.get("totalCashFromOperatingActivities")),
-        }
-
-    return extract(curr_end), extract(prev_end)
+    return (_extract_annual(income, balance, cashflow, curr_end),
+            _extract_annual(income, balance, cashflow, prev_end))
 
 
 def _score_pair(curr, prev):
@@ -149,30 +180,51 @@ def pit_fscore(ticker, as_of_date):
     return signals
 
 
+_QUARTERLY_MEM = {}
+
+
+def _quarterly_periods(ticker):
+    """Shared QUARTERLY machinery, parsed once per ticker: returns
+    (income, balance, cashflow, [(quarter_end, date_available), ...]) sorted by
+    quarter-end, or None if unusable. Availability uses each quarter's own
+    embedded filing_date (fallback quarter_end + QUARTERLY_LAG_DAYS)."""
+    if ticker in _QUARTERLY_MEM:
+        return _QUARTERLY_MEM[ticker]
+
+    ctx = None
+    data = _fetch_raw(ticker)
+    if data is not None:
+        fin = data.get("Financials", {})
+        income = fin.get("Income_Statement", {}).get("quarterly", {})
+        balance = fin.get("Balance_Sheet", {}).get("quarterly", {})
+        cashflow = fin.get("Cash_Flow", {}).get("quarterly", {})
+        if income:
+            periods = []
+            for date_str, inc_row in income.items():
+                q_end = pd.to_datetime(date_str)
+                avail = _quarter_availability(date_str, inc_row,
+                                              balance.get(date_str),
+                                              cashflow.get(date_str))
+                periods.append((q_end, avail))
+            periods.sort()
+            ctx = (income, balance, cashflow, periods)
+
+    _QUARTERLY_MEM[ticker] = ctx
+    return ctx
+
+
 def _quarterly_context(ticker, as_of_date):
     """Shared quarterly machinery: returns (income, balance, cashflow,
     available_quarters_sorted) where availability uses each quarter's own
     filing_date (fallback quarter_end + QUARTERLY_LAG_DAYS) and only quarters
     filed on/before as_of_date are included. Returns None if unusable."""
     as_of = pd.Timestamp(as_of_date)
-    data = _fetch_raw(ticker)
-    if data is None:
+    ctx = _quarterly_periods(ticker)
+    if ctx is None:
         return None
+    income, balance, cashflow, periods = ctx
 
-    fin = data.get("Financials", {})
-    income = fin.get("Income_Statement", {}).get("quarterly", {})
-    balance = fin.get("Balance_Sheet", {}).get("quarterly", {})
-    cashflow = fin.get("Cash_Flow", {}).get("quarterly", {})
-    if not income:
-        return None
-
-    available = []
-    for date_str, inc_row in income.items():
-        q_end = pd.to_datetime(date_str)
-        avail = _quarter_availability(date_str, inc_row,
-                                      balance.get(date_str), cashflow.get(date_str))
-        if avail <= as_of:
-            available.append(q_end)
+    available = [q_end for q_end, avail in periods if avail <= as_of]
     available.sort()
     return income, balance, cashflow, available
 
@@ -311,6 +363,82 @@ def pit_value_inputs(ticker, as_of_date):
     if ni is None or sh is None or sh <= 0:
         return None
     return {"net_income": ni, "shares": sh}
+
+
+# --------------------------------------------------------------------------- #
+# AS-OF TIMELINES — the look-ahead-safe lookup a backtest should use
+#
+# A backtest rebalancing on date D may only see fundamentals FILED on or before
+# D. Calling pit_fscore(ticker, D) once per rebalance month is the honest thing
+# to do but costs ~80ms a call, which is why the backtests originally reached
+# for a single fixed as-of per year instead — and that is exactly how the
+# look-ahead crept in.
+#
+# These lookups are the same answer, made affordable. Every pit_* function
+# above depends on as_of ONLY through WHICH periods are available at as_of, so
+# the value is a step function that can change only on a filing-availability
+# date. Evaluate once per such date, then bisect. Exactness (timeline lookup ==
+# direct pit_* call, for every ticker and date) is asserted in
+# test_backtest_lookahead.py.
+# --------------------------------------------------------------------------- #
+
+_FSCORE_TL = {}
+_FSCORE_Q_TL = {}
+_VALUE_TL = {}
+
+
+def _build_timeline(periods, score_at):
+    """[(effective_from, value), ...] — one evaluation per distinct availability
+    date, held flat until the next filing lands."""
+    dates, values = [], []
+    for avail in sorted({avail for _, avail in periods}):
+        dates.append(avail)
+        values.append(score_at(avail))
+    return dates, values
+
+
+def _lookup_asof(cache, ticker, as_of_date, periods_fn, score_at):
+    tl = cache.get(ticker)
+    if tl is None:
+        ctx = periods_fn(ticker)
+        tl = ([], []) if ctx is None else _build_timeline(ctx[3], score_at)
+        cache[ticker] = tl
+    dates, values = tl
+    i = bisect.bisect_right(dates, pd.Timestamp(as_of_date)) - 1
+    return values[i] if i >= 0 else None
+
+
+def pit_fscore_asof(ticker, as_of_date):
+    """Annual F-score as known on as_of_date. Identical to
+    pit_fscore(ticker, as_of_date), memoized per ticker so a backtest can
+    afford a true per-rebalance-date as-of instead of one fixed date per year."""
+    return _lookup_asof(_FSCORE_TL, ticker, as_of_date, _annual_periods,
+                        lambda d: pit_fscore(ticker, d))
+
+
+def pit_fscore_quarterly_yoy_asof(ticker, as_of_date):
+    """Quarterly-YoY F-score as known on as_of_date. Identical to
+    pit_fscore_quarterly_yoy(ticker, as_of_date), memoized per ticker."""
+    return _lookup_asof(_FSCORE_Q_TL, ticker, as_of_date, _quarterly_periods,
+                        lambda d: pit_fscore_quarterly_yoy(ticker, d))
+
+
+def pit_value_inputs_asof(ticker, as_of_date):
+    """Value inputs as known on as_of_date. Identical to
+    pit_value_inputs(ticker, as_of_date), memoized per ticker."""
+    return _lookup_asof(_VALUE_TL, ticker, as_of_date, _annual_periods,
+                        lambda d: pit_value_inputs(ticker, d))
+
+
+def drop_ticker_cache(ticker):
+    """Release one ticker's parsed payload and timelines. A full-universe
+    precompute holds ~825 parsed EODHD payloads otherwise; the timelines are
+    tiny, the raw JSON is not."""
+    from point_in_time import _RAW_MEM, _AVAIL_MEM
+    _RAW_MEM.pop(ticker, None)
+    _AVAIL_MEM.pop(ticker, None)
+    _ANNUAL_MEM.pop(ticker, None)
+    _QUARTERLY_MEM.pop(ticker, None)
 
 
 if __name__ == "__main__":

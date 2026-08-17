@@ -28,8 +28,8 @@ LIMITATIONS — flagged honestly:
 import pandas as pd
 import numpy as np
 from explore_constituents import get_sp500_membership, members_on_date
-from backtest_composite import (load_all_prices, cached_fscore, metrics,
-                                spy_benchmark)
+from backtest_composite import (load_all_prices, asof_fscore, metrics,
+                                spy_benchmark, drop_ticker_cache)
 from data_layer import get_sector
 
 TOP_N = 30
@@ -169,7 +169,6 @@ def run_backtest_cap(prices, membership, sectors, cap, start, end,
         today = dates[i]
         next_date = dates[i + 1]
         index_members = members_on_date(membership, today)
-        year = today.year
 
         rows = []
         for ticker in index_members:
@@ -182,7 +181,8 @@ def run_backtest_cap(prices, membership, sectors, cap, start, end,
                     or p_12mo <= 0 or p_now <= 0:
                 continue
             mom = (p_1mo / p_12mo) - 1
-            fs = cached_fscore(ticker, year)
+            # As-of the date being simulated — never a fixed date in its future.
+            fs = asof_fscore(ticker, today)
             rows.append({"ticker": ticker, "momentum": mom, "fscore": fs})
 
         df = pd.DataFrame(rows).dropna(subset=["fscore"])
@@ -224,12 +224,13 @@ def run_backtest_cap(prices, membership, sectors, cap, start, end,
     return pd.DataFrame(history).set_index("date")
 
 
-def precompute_fscores(prices, year_start=2005, year_end=2027):
+def precompute_fscores(prices, probe="2015-06-30"):
+    """Warm each ticker's as-of F-score timeline, then release its raw payload."""
     print("Precomputing annual F-scores...")
     tickers = sorted(prices.columns)
     for n, ticker in enumerate(tickers, 1):
-        for year in range(year_start, year_end):
-            cached_fscore(ticker, year)
+        asof_fscore(ticker, probe)
+        drop_ticker_cache(ticker)
         if n % 100 == 0:
             print(f"  {n}/{len(tickers)} done")
     print("Done.\n")

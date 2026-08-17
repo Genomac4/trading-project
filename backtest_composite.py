@@ -2,7 +2,9 @@ import os
 import numpy as np
 import pandas as pd
 from explore_constituents import get_sp500_membership, members_on_date
-from pit_factors import pit_fscore, pit_value_inputs, pit_fscore_quarterly_yoy
+from pit_factors import (pit_fscore, pit_value_inputs, pit_fscore_quarterly_yoy,
+                         pit_fscore_asof, pit_value_inputs_asof,
+                         pit_fscore_quarterly_yoy_asof, drop_ticker_cache)
 
 PRICE_DIR = "data/universe_prices"
 
@@ -11,6 +13,51 @@ _fscore_q_cache = {}
 _value_cache = {}
 
 
+# --------------------------------------------------------------------------- #
+# BACKTEST fundamentals lookups — as-of the date being simulated.
+#
+# These take the actual rebalance DATE, not a year. The year-keyed helpers below
+# resolved every month of year Y to {Y}-06-30, so a January-May rebalance was
+# handed fundamentals from up to five months in its own future: a real
+# look-ahead bug, not a methodology nuance. Anything that ranks stocks on a
+# simulated date must use these.
+# --------------------------------------------------------------------------- #
+def asof_fscore(ticker, as_of):
+    """Annual PIT F-score filed on or before `as_of`. None if unavailable."""
+    try:
+        return pit_fscore_asof(ticker, as_of)
+    except Exception:
+        return None
+
+
+def asof_fscore_quarterly(ticker, as_of):
+    """Quarterly-YoY analog of asof_fscore — same as-of date, same eligibility
+    rule, so the only difference is the annual -> quarterly-YoY F-score input."""
+    try:
+        return pit_fscore_quarterly_yoy_asof(ticker, as_of)
+    except Exception:
+        return None
+
+
+def asof_value(ticker, as_of):
+    """PIT net income + shares filed on or before `as_of`. None if unavailable."""
+    try:
+        return pit_value_inputs_asof(ticker, as_of)
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# LIVE-SCAN fundamentals lookups — year-keyed, as-of June 30 of that year.
+#
+# Kept for the dashboard, which scans TODAY and passes the current year: an
+# as-of in the recent past (or, Jan-May, harmlessly in the future, since data
+# that has not been filed yet cannot appear either way) simply means "latest
+# available", which is what a live scan wants.
+#
+# DO NOT use these to rank a simulated historical date — see the as-of helpers
+# above and test_backtest_lookahead.py.
+# --------------------------------------------------------------------------- #
 def cached_fscore(ticker, year):
     key = (ticker, year)
     if key not in _fscore_cache:
@@ -56,15 +103,19 @@ def load_all_prices():
     return pd.DataFrame(all_series).sort_index()
 
 
-def precompute(prices, year_start=2005, year_end=2027):
+def precompute(prices, probe="2015-06-30"):
+    """Warm the per-ticker as-of timelines, then release the raw payloads.
+
+    One touch per ticker builds the whole timeline (the value only changes when
+    a filing lands), so there is nothing year-shaped to loop over any more. The
+    probe date is arbitrary — it just forces the build."""
     print("Precomputing fundamentals factors...")
     tickers = sorted(prices.columns)
-    years = list(range(year_start, year_end))
     for n, ticker in enumerate(tickers, 1):
-        for year in years:
-            cached_fscore(ticker, year)
-            cached_fscore_quarterly(ticker, year)
-            cached_value(ticker, year)
+        asof_fscore(ticker, probe)
+        asof_fscore_quarterly(ticker, probe)
+        asof_value(ticker, probe)
+        drop_ticker_cache(ticker)
         if n % 100 == 0:
             print(f"  {n}/{len(tickers)} done")
     print("Done.\n")
@@ -82,6 +133,17 @@ def compute_trend_table(prices, monthly_dates):
     return trend  # DataFrame: month-end x ticker
 
 
+def winsorize(s, lower=0.01, upper=0.99):
+    """The same 1st/99th-percentile capping dashboard.winsorize applies before
+    z-scoring. Off by default here: the original factor-mix comparison was run
+    without it, so it stays off unless a run explicitly asks for it."""
+    valid = s.dropna()
+    if len(valid) < 2:
+        return s
+    lo, hi = valid.quantile(lower), valid.quantile(upper)
+    return s.clip(lower=lo, upper=hi)
+
+
 def zscore(series):
     s = series.astype(float)
     std = s.std()
@@ -93,7 +155,7 @@ def zscore(series):
 def run_backtest(prices, membership, trend_table, top_n=30, cost_per_trade=0.0005,
                  start="2017-01-01", end="2026-06-30",
                  w_mom=1.0, w_qual=0.0, w_val=0.0, w_trend=0.0, label="",
-                 fscore_fn=cached_fscore):
+                 fscore_fn=asof_fscore, winsorize_factors=False):
     all_daily = {t: prices[t] for t in prices.columns}
     monthly = prices.resample("ME").last().loc[start:end]
     trend_m = trend_table.loc[start:end]
@@ -107,7 +169,6 @@ def run_backtest(prices, membership, trend_table, top_n=30, cost_per_trade=0.000
         today = dates[i]
         next_date = dates[i + 1]
         index_members = members_on_date(membership, today)
-        year = today.year
 
         rows = []
         for ticker in index_members:
@@ -119,8 +180,9 @@ def run_backtest(prices, membership, trend_table, top_n=30, cost_per_trade=0.000
             if pd.isna(p_12mo) or pd.isna(p_1mo) or pd.isna(p_now) or p_12mo <= 0 or p_now <= 0:
                 continue
             mom = (p_1mo / p_12mo) - 1
-            fs = fscore_fn(ticker, year)
-            vi = cached_value(ticker, year)
+            # As-of the date being simulated — never a fixed date in its future.
+            fs = fscore_fn(ticker, today)
+            vi = asof_value(ticker, today)
             ey = None
             if vi is not None:
                 mktcap = p_now * vi["shares"]
@@ -147,13 +209,14 @@ def run_backtest(prices, membership, trend_table, top_n=30, cost_per_trade=0.000
         if len(df) < top_n:
             continue
 
-        comp = w_mom * zscore(df["momentum"])
+        prep = (lambda s: zscore(winsorize(s))) if winsorize_factors else zscore
+        comp = w_mom * prep(df["momentum"])
         if w_qual > 0:
-            comp = comp + w_qual * zscore(df["fscore"])
+            comp = comp + w_qual * prep(df["fscore"])
         if w_val > 0:
-            comp = comp + w_val * zscore(df["earn_yield"])
+            comp = comp + w_val * prep(df["earn_yield"])
         if w_trend > 0:
-            comp = comp + w_trend * zscore(df["trend"])
+            comp = comp + w_trend * prep(df["trend"])
         df["composite"] = comp
         df = df.sort_values("composite", ascending=False)
 
@@ -219,19 +282,25 @@ PERIODS = [
     ("2019-2026 (covid+AI bull)",   "2019-01-01", "2026-06-30"),
 ]
 
-# Each config carries which F-score feeds the quality weight. All existing
-# configs use the annual F-score (cached_fscore) exactly as before; the added
-# "MOM+QUALITY (quarterly)" is identical to "MOM+QUALITY" except it uses the
-# quarterly-YoY F-score, so the two are a clean head-to-head on quality input.
+# Each config carries which F-score feeds the quality weight. All configs use
+# the annual F-score (asof_fscore); "MOM+QUALITY (quarterly)" is identical to
+# "MOM+QUALITY" except it uses the quarterly-YoY F-score, so the two are a clean
+# head-to-head on quality input.
 CONFIGS = [
-    ("MOMENTUM",                1.0,  0.0,  0.0,  0.0, cached_fscore),
-    ("MOM+QUALITY",             0.5,  0.5,  0.0,  0.0, cached_fscore),
-    ("MOM+QUALITY (quarterly)", 0.5,  0.5,  0.0,  0.0, cached_fscore_quarterly),
-    ("MOM+QUAL+TREND",          0.4,  0.4,  0.0,  0.2, cached_fscore),
-    ("FULL (all four)",         0.3,  0.3,  0.2,  0.2, cached_fscore),
+    ("MOMENTUM",                1.0,  0.0,  0.0,  0.0, asof_fscore),
+    ("MOM+QUALITY",             0.5,  0.5,  0.0,  0.0, asof_fscore),
+    ("MOM+QUALITY (quarterly)", 0.5,  0.5,  0.0,  0.0, asof_fscore_quarterly),
+    ("MOM+QUAL+TREND",          0.4,  0.4,  0.0,  0.2, asof_fscore),
+    ("FULL (all four)",         0.3,  0.3,  0.2,  0.2, asof_fscore),
 ]
 
 if __name__ == "__main__":
+    import sys
+
+    # `python backtest_composite.py --winsorize` runs the same comparison with
+    # the live scan's 1st/99th-percentile capping applied before z-scoring.
+    WINSORIZE = "--winsorize" in sys.argv
+
     print("Loading prices...")
     prices = load_all_prices()
     print(f"Loaded {prices.shape[1]} tickers")
@@ -239,6 +308,7 @@ if __name__ == "__main__":
     precompute(prices)
     monthly_dates = prices.resample("ME").last().index
     trend_table = compute_trend_table(prices, monthly_dates)
+    print(f"Factor treatment: {'WINSORIZED (1st/99th)' if WINSORIZE else 'RAW (no winsorizing)'}\n")
 
     for pname, start, end in PERIODS:
         print(f"\n{'#'*70}\nPERIOD: {pname}\n{'#'*70}")
@@ -248,7 +318,8 @@ if __name__ == "__main__":
             res = run_backtest(prices, membership, trend_table,
                                start=start, end=end,
                                w_mom=wm, w_qual=wq, w_val=wv, w_trend=wt,
-                               label=label, fscore_fn=fscore_fn)
+                               label=label, fscore_fn=fscore_fn,
+                               winsorize_factors=WINSORIZE)
             if len(res) == 0:
                 continue
             m = metrics(res["strat_return"])
