@@ -10,14 +10,31 @@ from data_layer import get_valuation
 # backtest_composite.py):
 #   - TRENDING (SPY above its 200d MA): a momentum+quality tilt earned Sharpe
 #     0.96 vs SPY's 0.88 over 2019-2026.
-#   - CHOPPY (SPY below its 200d MA): a trend/quality tilt had the best Sharpe
-#     in the choppy 2013-2018 stretch.
+#   - CHOPPY (SPY below its 200d MA): NOT backtest-derived — see below.
 # Because they are picked from how factors behaved across distinct historical
 # regimes rather than tuned to a single sample, treat them as a robust prior,
 # not a fitted optimum. The overfitting risk is real but deliberately bounded —
 # there are only two coarse regimes and no per-parameter search.
+#
+# CHOPPY IS A JUDGMENT CALL, NOT A BACKTEST RESULT (audited 2026-08-16).
+# This comment used to claim a trend/quality tilt had the best Sharpe over the
+# choppy 2013-2018 stretch. That is false. In that period FULL (all four
+# factors, 0.3/0.3/0.2/0.2) beat MOM+QUAL+TREND on Sharpe both before and after
+# the backtest look-ahead fix: 0.71 vs 0.59 pre-fix, 0.68 vs 0.54 post-fix.
+# Two separate gaps, both still open:
+#   1. The trend/quality config that WAS tested is 0.4/0.4/0.0/0.2. The live
+#      CHOPPY vector below is 0.3/0.4/0.0/0.3 — a different vector that has
+#      never been run through a backtest at all.
+#   2. Even the tested 0.4/0.4/0.0/0.2 was not the best config in 2013-2018;
+#      FULL was.
+# Consequence: if SPY closes below its 200d MA, unvalidated weights go live
+# silently. It has never fired — all 11 scan snapshots to date show TRENDING —
+# so this is a latent risk, not a current one. Do not describe CHOPPY as
+# backtest-backed until either the live vector is actually tested or the
+# weights are changed to something that was.
 REGIME_WEIGHTS = {
     "TRENDING": {"momentum": 0.5, "quality": 0.5, "value": 0.0, "trend": 0.0},
+    # UN-BACKTESTED — see the note above before trusting or changing these.
     "CHOPPY":   {"momentum": 0.3, "quality": 0.4, "value": 0.0, "trend": 0.3},
 }
 
@@ -40,8 +57,9 @@ def get_regime_weights(spy_series):
         pct_vs_200d  : float, SPY's % distance from its 200d MA
         weights      : dict of {momentum, quality, value, trend} weights
 
-    The returned weights come from the multi-period backtest documented above,
-    not from optimization.
+    The TRENDING weights come from the multi-period backtest documented above,
+    not from optimization. The CHOPPY weights are un-backtested — read the note
+    at REGIME_WEIGHTS before relying on them.
     """
     spy_series = spy_series.dropna()
     ma200 = spy_series.rolling(200).mean().iloc[-1]

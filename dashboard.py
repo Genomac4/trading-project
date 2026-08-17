@@ -202,7 +202,8 @@ def select_top(ranked, top_n, diversify=False, cap=2):
 
 # ---------- Regime ----------
 def current_regime():
-    """Single source of truth for the regime + its backtest-derived weights."""
+    """Single source of truth for the regime + its weights. TRENDING weights are
+    backtest-derived; CHOPPY weights are not — see screener.REGIME_WEIGHTS."""
     return get_regime_weights(spy_prices())
 
 
@@ -215,8 +216,14 @@ def regime_banner(reg):
         st.success(f"MARKET REGIME: TRENDING — SPY {pct:+.1%} vs 200d MA. "
                    f"Active weight set (momentum-heavy, from backtest): {weight_str}.")
     else:
+        # Not "from backtest": the live CHOPPY vector was never backtested.
+        # See the note at screener.REGIME_WEIGHTS. Say so here rather than
+        # imply support that does not exist — this banner is the only place a
+        # first-ever CHOPPY regime would announce itself.
         st.warning(f"MARKET REGIME: CHOPPY/DEFENSIVE — SPY {pct:+.1%} vs 200d MA. "
-                   f"Active weight set (quality/trend-heavy, from backtest): {weight_str}.")
+                   f"Active weight set (quality/trend-heavy): {weight_str}. "
+                   f"⚠ These CHOPPY weights are UNVALIDATED — never backtested "
+                   f"(see screener.REGIME_WEIGHTS). Treat rankings with extra caution.")
 
 
 # ---------- Thesis ----------
